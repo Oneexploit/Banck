@@ -91,6 +91,10 @@ impl Customer {
         }
     }
 
+    pub(crate) fn from_persisted(id: CustomerId, full_name: String, email: String) -> Self {
+        Self::new(id, full_name, email)
+    }
+
     pub const fn id(&self) -> CustomerId {
         self.id
     }
@@ -128,6 +132,16 @@ impl User {
             customer_id,
             password_hash,
         }
+    }
+
+    pub(crate) fn from_persisted(
+        id: UserId,
+        username: String,
+        role: Role,
+        customer_id: Option<CustomerId>,
+        password_hash: String,
+    ) -> Self {
+        Self::new(id, username, role, customer_id, password_hash)
     }
 
     pub const fn id(&self) -> UserId {

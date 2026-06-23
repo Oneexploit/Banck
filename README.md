@@ -60,15 +60,23 @@ Status: complete.
 Status: complete.
 
 - Add a SQLite persistence backend with `schema_migrations`.
-- Store full application state in a durable `app_state` snapshot table.
+- Store full application state in a durable `app_state` snapshot table as the compatibility format.
 - Add SQLite round-trip and migration tests.
 - Add CLI commands for `save_sqlite` and `load_sqlite`.
+
+### Phase 7: Normalized SQLite Storage
+
+Status: complete.
+
+- Add schema version 2 with normalized `customers`, `users`, `accounts`, `transactions`, and `audit_entries` tables.
+- Migrate version 1 snapshot databases into the normalized tables automatically.
+- Prefer normalized tables on load while keeping the snapshot table as a fallback.
+- Add tests for normalized writes, stale snapshot tolerance, and version 1 migration.
 
 ### Future Hardening
 
 Planned:
 
-- Normalize SQLite persistence into account, transaction, customer, user, and audit tables.
 - Add Postgres support and production-grade migrations.
 - Add request IDs and structured tracing/log output.
 - Add rate limiting and account lockout for failed logins.
