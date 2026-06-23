@@ -17,7 +17,8 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use tokio::{
     net::TcpListener,
@@ -38,6 +39,8 @@ const REQUEST_ID_HEADER: &str = "x-request-id";
 const FAILED_LOGIN_LIMIT: usize = 5;
 const FAILED_LOGIN_WINDOW_SECONDS: u64 = 15 * 60;
 const FAILED_LOGIN_LOCKOUT_SECONDS: u64 = 15 * 60;
+const SESSION_TOKEN_BYTES: usize = 32;
+const SESSION_TTL_SECONDS: u64 = 8 * 60 * 60;
 
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 static TRACING_INIT: Once = Once::new();
@@ -45,6 +48,7 @@ static TRACING_INIT: Once = Once::new();
 #[derive(Clone)]
 pub struct ApiState {
     app: Arc<RwLock<AppState>>,
+    sessions: Arc<Mutex<ApiSessionStore>>,
     auth_throttle: Arc<Mutex<AuthThrottle>>,
 }
 
@@ -52,6 +56,7 @@ impl ApiState {
     pub fn new(app: AppState) -> Self {
         Self {
             app: Arc::new(RwLock::new(app)),
+            sessions: Arc::new(Mutex::new(ApiSessionStore::new())),
             auth_throttle: Arc::new(Mutex::new(AuthThrottle::new())),
         }
     }
@@ -70,6 +75,7 @@ pub fn router(app: AppState) -> Router {
         .route("/health", get(health))
         .route("/auth/bootstrap-admin", post(bootstrap_admin))
         .route("/auth/login", post(login))
+        .route("/auth/logout", post(logout))
         .route("/customers", get(list_customers).post(create_customer))
         .route("/users", get(list_users).post(create_user))
         .route("/accounts", get(list_accounts).post(create_account))
@@ -191,8 +197,16 @@ async fn bootstrap_admin(
         Some(format!("user:{}", session.user_id())),
         "admin bootstrapped",
     )?;
+    let issued_session = state
+        .sessions
+        .lock()
+        .await
+        .issue(session.clone(), current_epoch_seconds());
 
-    Ok(Json(SessionResponse::from_session(&session)))
+    Ok(Json(SessionResponse::from_session(
+        &session,
+        issued_session,
+    )))
 }
 
 async fn login(
@@ -241,8 +255,40 @@ async fn login(
             return Err(ApiError::from_identity(error));
         }
     };
+    let issued_session = state
+        .sessions
+        .lock()
+        .await
+        .issue(session.clone(), current_epoch_seconds());
 
-    Ok(Json(SessionResponse::from_session(&session)))
+    Ok(Json(SessionResponse::from_session(
+        &session,
+        issued_session,
+    )))
+}
+
+async fn logout(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<Json<LogoutResponse>, ApiError> {
+    let token = bearer_token(&headers)?;
+    let session = {
+        let mut sessions = state.sessions.lock().await;
+        let session = sessions.authenticate(&token, current_epoch_seconds())?;
+        sessions.revoke(&token);
+        session
+    };
+    let mut app = state.app.write().await;
+    record_audit(
+        &mut app,
+        AuditActor::from_session(&session),
+        AuditAction::Logout,
+        AuditOutcome::Success,
+        Some(format!("user:{}", session.user_id())),
+        "logout succeeded",
+    )?;
+
+    Ok(Json(LogoutResponse { logged_out: true }))
 }
 
 async fn create_customer(
@@ -250,9 +296,9 @@ async fn create_customer(
     headers: HeaderMap,
     Json(payload): Json<CreateCustomerRequest>,
 ) -> Result<Json<CustomerResponse>, ApiError> {
-    let mut app = state.app.write().await;
-    let session = authenticate_request(&app, &headers)?;
+    let session = authenticate_request(&state, &headers).await?;
     authorize(&session, Permission::ManageIdentity)?;
+    let mut app = state.app.write().await;
     let response = {
         let customer = app
             .identities
@@ -277,9 +323,9 @@ async fn list_audit(
     headers: HeaderMap,
     Query(query): Query<AuditQuery>,
 ) -> Result<Json<Vec<AuditEntryResponse>>, ApiError> {
-    let app = state.app.read().await;
-    let session = authenticate_request(&app, &headers)?;
+    let session = authenticate_request(&state, &headers).await?;
     authorize(&session, Permission::ManageIdentity)?;
+    let app = state.app.read().await;
     let limit = validated_limit(query.limit)?;
     validate_time_window(query.from_epoch_seconds, query.to_epoch_seconds)?;
     let entries = app
@@ -300,9 +346,9 @@ async fn list_customers(
     State(state): State<ApiState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<CustomerResponse>>, ApiError> {
-    let app = state.app.read().await;
-    let session = authenticate_request(&app, &headers)?;
+    let session = authenticate_request(&state, &headers).await?;
     authorize(&session, Permission::ManageIdentity)?;
+    let app = state.app.read().await;
     let customers = app
         .identities
         .customers()
@@ -317,9 +363,9 @@ async fn create_user(
     headers: HeaderMap,
     Json(payload): Json<CreateUserRequest>,
 ) -> Result<Json<UserResponse>, ApiError> {
-    let mut app = state.app.write().await;
-    let session = authenticate_request(&app, &headers)?;
+    let session = authenticate_request(&state, &headers).await?;
     authorize(&session, Permission::ManageIdentity)?;
+    let mut app = state.app.write().await;
     let response = {
         let user = app
             .identities
@@ -349,9 +395,9 @@ async fn list_users(
     State(state): State<ApiState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<UserResponse>>, ApiError> {
-    let app = state.app.read().await;
-    let session = authenticate_request(&app, &headers)?;
+    let session = authenticate_request(&state, &headers).await?;
     authorize(&session, Permission::ManageIdentity)?;
+    let app = state.app.read().await;
     let users = app
         .identities
         .users()
@@ -366,9 +412,9 @@ async fn create_account(
     headers: HeaderMap,
     Json(payload): Json<CreateAccountRequest>,
 ) -> Result<Json<AccountResponse>, ApiError> {
-    let mut app = state.app.write().await;
-    let session = authenticate_request(&app, &headers)?;
+    let session = authenticate_request(&state, &headers).await?;
     authorize(&session, Permission::ManageAccounts)?;
+    let mut app = state.app.write().await;
 
     if let Some(customer_id) = payload.owner_id {
         app.identities
@@ -404,8 +450,8 @@ async fn list_accounts(
     State(state): State<ApiState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<AccountResponse>>, ApiError> {
+    let session = authenticate_request(&state, &headers).await?;
     let app = state.app.read().await;
-    let session = authenticate_request(&app, &headers)?;
     let accounts = visible_accounts(&app, &session)?;
 
     Ok(Json(accounts))
@@ -416,8 +462,8 @@ async fn get_account(
     headers: HeaderMap,
     Path(account_id): Path<AccountId>,
 ) -> Result<Json<AccountResponse>, ApiError> {
+    let session = authenticate_request(&state, &headers).await?;
     let app = state.app.read().await;
-    let session = authenticate_request(&app, &headers)?;
     ensure_account_view(&app, &session, account_id)?;
     let account = app.bank.account(account_id).map_err(ApiError::from_bank)?;
 
@@ -430,8 +476,8 @@ async fn list_account_transactions(
     Path(account_id): Path<AccountId>,
     Query(query): Query<TransactionQuery>,
 ) -> Result<Json<Vec<TransactionResponse>>, ApiError> {
+    let session = authenticate_request(&state, &headers).await?;
     let app = state.app.read().await;
-    let session = authenticate_request(&app, &headers)?;
     ensure_account_view(&app, &session, account_id)?;
     let limit = validated_limit(query.limit)?;
     validate_time_window(query.from_epoch_seconds, query.to_epoch_seconds)?;
@@ -489,9 +535,9 @@ async fn apply_fee(
     Path(account_id): Path<AccountId>,
     Json(payload): Json<MoneyOperationRequest>,
 ) -> Result<Json<AccountResponse>, ApiError> {
-    let mut app = state.app.write().await;
-    let session = authenticate_request(&app, &headers)?;
+    let session = authenticate_request(&state, &headers).await?;
     authorize(&session, Permission::MoveMoney)?;
+    let mut app = state.app.write().await;
     let amount = money_from_cents(payload.amount_cents)?;
     app.bank
         .apply_fee(account_id, amount)
@@ -516,9 +562,9 @@ async fn request_loan(
     Path(account_id): Path<AccountId>,
     Json(payload): Json<MoneyOperationRequest>,
 ) -> Result<Json<AccountResponse>, ApiError> {
-    let mut app = state.app.write().await;
-    let session = authenticate_request(&app, &headers)?;
+    let session = authenticate_request(&state, &headers).await?;
     authorize(&session, Permission::MoveMoney)?;
+    let mut app = state.app.write().await;
     let amount = money_from_cents(payload.amount_cents)?;
     app.bank
         .request_loan(account_id, amount)
@@ -543,8 +589,8 @@ async fn pay_loan(
     Path(account_id): Path<AccountId>,
     Json(payload): Json<MoneyOperationRequest>,
 ) -> Result<Json<AccountResponse>, ApiError> {
+    let session = authenticate_request(&state, &headers).await?;
     let mut app = state.app.write().await;
-    let session = authenticate_request(&app, &headers)?;
     ensure_account_money_access(&app, &session, account_id)?;
     let amount = money_from_cents(payload.amount_cents)?;
     app.bank
@@ -569,8 +615,8 @@ async fn transfer(
     headers: HeaderMap,
     Json(payload): Json<TransferRequest>,
 ) -> Result<Json<TransferResponse>, ApiError> {
+    let session = authenticate_request(&state, &headers).await?;
     let mut app = state.app.write().await;
-    let session = authenticate_request(&app, &headers)?;
     ensure_account_money_access(&app, &session, payload.from_account_id)?;
     let amount = money_from_cents(payload.amount_cents)?;
     app.bank
@@ -611,8 +657,8 @@ async fn mutate_account_money(
     action: AuditAction,
     operation: impl FnOnce(&mut AppState, AccountId, Money) -> BankResult<()>,
 ) -> Result<Json<AccountResponse>, ApiError> {
+    let session = authenticate_request(&state, &headers).await?;
     let mut app = state.app.write().await;
-    let session = authenticate_request(&app, &headers)?;
     ensure_account_money_access(&app, &session, account_id)?;
     let amount = money_from_cents(amount_cents)?;
     operation(&mut app, account_id, amount).map_err(ApiError::from_bank)?;
@@ -630,34 +676,28 @@ async fn mutate_account_money(
     Ok(Json(response))
 }
 
-fn authenticate_request(app: &AppState, headers: &HeaderMap) -> Result<Session, ApiError> {
-    let (username, password) = basic_credentials(headers)?;
-
-    app.identities
-        .authenticate(username, &password)
-        .map_err(ApiError::from_identity)
+async fn authenticate_request(state: &ApiState, headers: &HeaderMap) -> Result<Session, ApiError> {
+    let token = bearer_token(headers)?;
+    state
+        .sessions
+        .lock()
+        .await
+        .authenticate(&token, current_epoch_seconds())
 }
 
-fn basic_credentials(headers: &HeaderMap) -> Result<(String, String), ApiError> {
+fn bearer_token(headers: &HeaderMap) -> Result<String, ApiError> {
     let value = headers
         .get("authorization")
         .ok_or_else(|| ApiError::unauthorized("missing Authorization header"))?
         .to_str()
         .map_err(|_| ApiError::unauthorized("invalid Authorization header"))?;
 
-    let encoded = value
-        .strip_prefix("Basic ")
-        .ok_or_else(|| ApiError::unauthorized("Authorization header must use Basic auth"))?;
-    let decoded = BASE64
-        .decode(encoded)
-        .map_err(|_| ApiError::unauthorized("invalid Basic auth payload"))?;
-    let credentials = String::from_utf8(decoded)
-        .map_err(|_| ApiError::unauthorized("invalid Basic auth encoding"))?;
-    let (username, password) = credentials
-        .split_once(':')
-        .ok_or_else(|| ApiError::unauthorized("Basic auth must be username:password"))?;
-
-    Ok((username.to_string(), password.to_string()))
+    value
+        .strip_prefix("Bearer ")
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(ToString::to_string)
+        .ok_or_else(|| ApiError::unauthorized("Authorization header must use Bearer token"))
 }
 
 fn authorize(session: &Session, permission: Permission) -> Result<(), ApiError> {
@@ -858,6 +898,80 @@ fn timestamp_matches_query(
     }
 
     true
+}
+
+#[derive(Debug, Default)]
+struct ApiSessionStore {
+    sessions_by_token: BTreeMap<String, StoredApiSession>,
+}
+
+impl ApiSessionStore {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn issue(&mut self, session: Session, now: u64) -> IssuedSession {
+        self.remove_expired(now);
+        let access_token = self.unused_token();
+        let expires_at_epoch_seconds = now.saturating_add(SESSION_TTL_SECONDS);
+        self.sessions_by_token.insert(
+            access_token.clone(),
+            StoredApiSession {
+                session,
+                expires_at_epoch_seconds,
+            },
+        );
+
+        IssuedSession {
+            access_token,
+            expires_at_epoch_seconds,
+        }
+    }
+
+    fn authenticate(&mut self, token: &str, now: u64) -> Result<Session, ApiError> {
+        self.remove_expired(now);
+        self.sessions_by_token
+            .get(token)
+            .map(|session| session.session.clone())
+            .ok_or_else(|| ApiError::unauthorized("invalid or expired bearer token"))
+    }
+
+    fn revoke(&mut self, token: &str) {
+        self.sessions_by_token.remove(token);
+    }
+
+    fn unused_token(&self) -> String {
+        loop {
+            let token = generate_session_token();
+
+            if !self.sessions_by_token.contains_key(&token) {
+                return token;
+            }
+        }
+    }
+
+    fn remove_expired(&mut self, now: u64) {
+        self.sessions_by_token
+            .retain(|_, session| session.expires_at_epoch_seconds > now);
+    }
+}
+
+#[derive(Debug, Clone)]
+struct StoredApiSession {
+    session: Session,
+    expires_at_epoch_seconds: u64,
+}
+
+#[derive(Debug, Clone)]
+struct IssuedSession {
+    access_token: String,
+    expires_at_epoch_seconds: u64,
+}
+
+fn generate_session_token() -> String {
+    let mut token = [0_u8; SESSION_TOKEN_BYTES];
+    OsRng.fill_bytes(&mut token);
+    URL_SAFE_NO_PAD.encode(token)
 }
 
 #[derive(Debug, Default)]
@@ -1152,17 +1266,28 @@ struct SessionResponse {
     username: String,
     role: Role,
     customer_id: Option<CustomerId>,
+    access_token: String,
+    token_type: String,
+    expires_at_epoch_seconds: u64,
 }
 
 impl SessionResponse {
-    fn from_session(session: &Session) -> Self {
+    fn from_session(session: &Session, issued_session: IssuedSession) -> Self {
         Self {
             user_id: session.user_id(),
             username: session.username().to_string(),
             role: session.role(),
             customer_id: session.customer_id(),
+            access_token: issued_session.access_token,
+            token_type: "Bearer".to_string(),
+            expires_at_epoch_seconds: issued_session.expires_at_epoch_seconds,
         }
     }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct LogoutResponse {
+    logged_out: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1296,15 +1421,14 @@ mod tests {
         body::{Body, to_bytes},
         http::{Request, StatusCode},
     };
-    use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
     use serde_json::{Value, json};
     use tower::ServiceExt;
 
     use super::router;
     use crate::AppState;
 
-    fn basic(username: &str, password: &str) -> String {
-        format!("Basic {}", BASE64.encode(format!("{username}:{password}")))
+    fn bearer(token: &str) -> String {
+        format!("Bearer {token}")
     }
 
     async fn response_json(response: axum::response::Response) -> Value {
@@ -1316,7 +1440,7 @@ mod tests {
         app: axum::Router,
         method: &str,
         uri: &str,
-        auth: Option<(&str, &str)>,
+        auth: Option<&str>,
         body: Value,
     ) -> axum::response::Response {
         let mut builder = Request::builder()
@@ -1324,8 +1448,8 @@ mod tests {
             .uri(uri)
             .header("content-type", "application/json");
 
-        if let Some((username, password)) = auth {
-            builder = builder.header("authorization", basic(username, password));
+        if let Some(token) = auth {
+            builder = builder.header("authorization", bearer(token));
         }
 
         let request = builder.body(Body::from(body.to_string())).unwrap();
@@ -1335,12 +1459,9 @@ mod tests {
             .unwrap_or_else(|_| panic!("request failed: {method} {uri}"))
     }
 
-    #[tokio::test]
-    async fn bootstraps_admin_and_creates_account() {
-        let app = router(AppState::new());
-
+    async fn bootstrap_admin_token(app: axum::Router) -> String {
         let response = request(
-            app.clone(),
+            app,
             "POST",
             "/auth/bootstrap-admin",
             None,
@@ -1352,12 +1473,39 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["token_type"], "Bearer");
+        body["access_token"].as_str().unwrap().to_string()
+    }
+
+    async fn login_token(app: axum::Router, username: &str, password: &str) -> String {
+        let response = request(
+            app,
+            "POST",
+            "/auth/login",
+            None,
+            json!({
+                "username": username,
+                "password": password
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        body["access_token"].as_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn bootstraps_admin_and_creates_account() {
+        let app = router(AppState::new());
+
+        let admin_token = bootstrap_admin_token(app.clone()).await;
 
         let response = request(
             app.clone(),
             "POST",
             "/customers",
-            Some(("admin", "correct-password")),
+            Some(&admin_token),
             json!({
                 "id": 10,
                 "full_name": "Alice",
@@ -1371,7 +1519,7 @@ mod tests {
             app.clone(),
             "POST",
             "/accounts",
-            Some(("admin", "correct-password")),
+            Some(&admin_token),
             json!({
                 "id": 100,
                 "owner_id": 10,
@@ -1468,26 +1616,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn logout_revokes_bearer_token() {
+        let app = router(AppState::new());
+        let admin_token = bootstrap_admin_token(app.clone()).await;
+
+        let response = request(
+            app.clone(),
+            "POST",
+            "/auth/logout",
+            Some(&admin_token),
+            json!({}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["logged_out"], true);
+
+        let response = request(app, "GET", "/accounts", Some(&admin_token), json!({})).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
     async fn customer_can_only_see_owned_accounts() {
         let app = router(AppState::new());
 
-        request(
-            app.clone(),
-            "POST",
-            "/auth/bootstrap-admin",
-            None,
-            json!({
-                "user_id": 1,
-                "username": "admin",
-                "password": "correct-password"
-            }),
-        )
-        .await;
+        let admin_token = bootstrap_admin_token(app.clone()).await;
         request(
             app.clone(),
             "POST",
             "/customers",
-            Some(("admin", "correct-password")),
+            Some(&admin_token),
             json!({"id": 10, "full_name": "Alice", "email": "alice@example.com"}),
         )
         .await;
@@ -1495,7 +1653,7 @@ mod tests {
             app.clone(),
             "POST",
             "/customers",
-            Some(("admin", "correct-password")),
+            Some(&admin_token),
             json!({"id": 20, "full_name": "Bob", "email": "bob@example.com"}),
         )
         .await;
@@ -1503,7 +1661,7 @@ mod tests {
             app.clone(),
             "POST",
             "/users",
-            Some(("admin", "correct-password")),
+            Some(&admin_token),
             json!({
                 "id": 2,
                 "username": "alice",
@@ -1517,7 +1675,7 @@ mod tests {
             app.clone(),
             "POST",
             "/accounts",
-            Some(("admin", "correct-password")),
+            Some(&admin_token),
             json!({
                 "id": 100,
                 "owner_id": 10,
@@ -1531,7 +1689,7 @@ mod tests {
             app.clone(),
             "POST",
             "/accounts",
-            Some(("admin", "correct-password")),
+            Some(&admin_token),
             json!({
                 "id": 200,
                 "owner_id": 20,
@@ -1541,12 +1699,13 @@ mod tests {
             }),
         )
         .await;
+        let alice_token = login_token(app.clone(), "alice", "correct-password").await;
 
         let response = request(
             app.clone(),
             "GET",
             "/accounts",
-            Some(("alice", "correct-password")),
+            Some(&alice_token),
             json!({}),
         )
         .await;
@@ -1555,14 +1714,7 @@ mod tests {
         assert_eq!(body.as_array().unwrap().len(), 1);
         assert_eq!(body[0]["id"], 100);
 
-        let response = request(
-            app,
-            "GET",
-            "/accounts/200",
-            Some(("alice", "correct-password")),
-            json!({}),
-        )
-        .await;
+        let response = request(app, "GET", "/accounts/200", Some(&alice_token), json!({})).await;
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
@@ -1570,23 +1722,12 @@ mod tests {
     async fn transfer_updates_balances() {
         let app = router(AppState::new());
 
-        request(
-            app.clone(),
-            "POST",
-            "/auth/bootstrap-admin",
-            None,
-            json!({
-                "user_id": 1,
-                "username": "admin",
-                "password": "correct-password"
-            }),
-        )
-        .await;
+        let admin_token = bootstrap_admin_token(app.clone()).await;
         request(
             app.clone(),
             "POST",
             "/accounts",
-            Some(("admin", "correct-password")),
+            Some(&admin_token),
             json!({
                 "id": 100,
                 "owner_id": null,
@@ -1600,7 +1741,7 @@ mod tests {
             app.clone(),
             "POST",
             "/accounts",
-            Some(("admin", "correct-password")),
+            Some(&admin_token),
             json!({
                 "id": 200,
                 "owner_id": null,
@@ -1615,7 +1756,7 @@ mod tests {
             app,
             "POST",
             "/transfers",
-            Some(("admin", "correct-password")),
+            Some(&admin_token),
             json!({
                 "from_account_id": 100,
                 "to_account_id": 200,
@@ -1633,23 +1774,12 @@ mod tests {
     async fn audit_endpoint_returns_recorded_events() {
         let app = router(AppState::new());
 
-        request(
-            app.clone(),
-            "POST",
-            "/auth/bootstrap-admin",
-            None,
-            json!({
-                "user_id": 1,
-                "username": "admin",
-                "password": "correct-password"
-            }),
-        )
-        .await;
+        let admin_token = bootstrap_admin_token(app.clone()).await;
         request(
             app.clone(),
             "POST",
             "/accounts",
-            Some(("admin", "correct-password")),
+            Some(&admin_token),
             json!({
                 "id": 100,
                 "owner_id": null,
@@ -1664,7 +1794,7 @@ mod tests {
             app,
             "GET",
             "/audit?order=asc",
-            Some(("admin", "correct-password")),
+            Some(&admin_token),
             json!({}),
         )
         .await;
@@ -1681,23 +1811,12 @@ mod tests {
     async fn audit_endpoint_filters_recorded_events() {
         let app = router(AppState::new());
 
-        request(
-            app.clone(),
-            "POST",
-            "/auth/bootstrap-admin",
-            None,
-            json!({
-                "user_id": 1,
-                "username": "admin",
-                "password": "correct-password"
-            }),
-        )
-        .await;
+        let admin_token = bootstrap_admin_token(app.clone()).await;
         request(
             app.clone(),
             "POST",
             "/accounts",
-            Some(("admin", "correct-password")),
+            Some(&admin_token),
             json!({
                 "id": 100,
                 "owner_id": null,
@@ -1712,7 +1831,7 @@ mod tests {
             app,
             "GET",
             "/audit?action=create_account&outcome=success&target=account%3A100&limit=1",
-            Some(("admin", "correct-password")),
+            Some(&admin_token),
             json!({}),
         )
         .await;
@@ -1729,23 +1848,12 @@ mod tests {
     async fn account_transactions_endpoint_filters_orders_and_limits() {
         let app = router(AppState::new());
 
-        request(
-            app.clone(),
-            "POST",
-            "/auth/bootstrap-admin",
-            None,
-            json!({
-                "user_id": 1,
-                "username": "admin",
-                "password": "correct-password"
-            }),
-        )
-        .await;
+        let admin_token = bootstrap_admin_token(app.clone()).await;
         request(
             app.clone(),
             "POST",
             "/accounts",
-            Some(("admin", "correct-password")),
+            Some(&admin_token),
             json!({
                 "id": 100,
                 "owner_id": null,
@@ -1759,7 +1867,7 @@ mod tests {
             app.clone(),
             "POST",
             "/accounts/100/deposit",
-            Some(("admin", "correct-password")),
+            Some(&admin_token),
             json!({"amount_cents": 2500}),
         )
         .await;
@@ -1767,7 +1875,7 @@ mod tests {
             app.clone(),
             "POST",
             "/accounts/100/withdraw",
-            Some(("admin", "correct-password")),
+            Some(&admin_token),
             json!({"amount_cents": 500}),
         )
         .await;
@@ -1776,7 +1884,7 @@ mod tests {
             app.clone(),
             "GET",
             "/accounts/100/transactions?kind=deposit&limit=1",
-            Some(("admin", "correct-password")),
+            Some(&admin_token),
             json!({}),
         )
         .await;
@@ -1791,7 +1899,7 @@ mod tests {
             app,
             "GET",
             "/accounts/100/transactions?limit=2&order=desc",
-            Some(("admin", "correct-password")),
+            Some(&admin_token),
             json!({}),
         )
         .await;

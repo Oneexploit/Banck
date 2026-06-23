@@ -923,6 +923,7 @@ fn audit_action_from_db(field: &'static str, value: &str) -> SqliteStoreResult<A
     match value {
         "bootstrap_admin" => Ok(AuditAction::BootstrapAdmin),
         "login" => Ok(AuditAction::Login),
+        "logout" => Ok(AuditAction::Logout),
         "create_customer" => Ok(AuditAction::CreateCustomer),
         "create_user" => Ok(AuditAction::CreateUser),
         "create_account" => Ok(AuditAction::CreateAccount),

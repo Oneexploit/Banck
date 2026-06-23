@@ -41,7 +41,7 @@ Status: complete.
 
 - Add a REST API with Axum.
 - Keep the CLI as the default admin/dev client.
-- Add Basic-auth protected endpoints for identity and banking operations.
+- Add protected endpoints for identity and banking operations.
 - Add request validation, structured JSON responses, and API tests.
 - Add a `serve` command for running the HTTP API.
 
@@ -91,13 +91,22 @@ Status: complete.
 - Add temporary login throttling after repeated failed authentication attempts.
 - Add tests for request IDs and login throttling.
 
+### Phase 10: Token-Based API Sessions
+
+Status: complete.
+
+- Replace password-per-request API authentication with opaque Bearer session tokens.
+- Return access tokens from bootstrap and login responses with an expiration timestamp.
+- Add `POST /auth/logout` to revoke the current token.
+- Record logout events in the audit trail and persist them through SQLite.
+
 ### Future Hardening
 
 Planned:
 
 - Add Postgres support and production-grade migrations.
 - Add persistent account lockout policies and administrative unlock workflows.
-- Replace Basic auth with signed session tokens for the API.
+- Replace opaque in-memory API tokens with signed or durable refreshable sessions.
 
 ## Development Checks
 
@@ -123,4 +132,4 @@ Start the HTTP API:
 cargo run -- serve 127.0.0.1:3000
 ```
 
-The API starts empty. Use `POST /auth/bootstrap-admin` first, then call protected endpoints with Basic auth.
+The API starts empty. Use `POST /auth/bootstrap-admin` first, then call protected endpoints with `Authorization: Bearer <access_token>`.

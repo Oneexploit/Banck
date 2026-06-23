@@ -48,6 +48,7 @@ impl fmt::Display for AuditActor {
 pub enum AuditAction {
     BootstrapAdmin,
     Login,
+    Logout,
     CreateCustomer,
     CreateUser,
     CreateAccount,
@@ -73,6 +74,7 @@ impl fmt::Display for AuditAction {
         match self {
             Self::BootstrapAdmin => write!(formatter, "bootstrap_admin"),
             Self::Login => write!(formatter, "login"),
+            Self::Logout => write!(formatter, "logout"),
             Self::CreateCustomer => write!(formatter, "create_customer"),
             Self::CreateUser => write!(formatter, "create_user"),
             Self::CreateAccount => write!(formatter, "create_account"),
