@@ -55,11 +55,21 @@ Status: complete.
 - Persist audit entries in the application JSON snapshot and support upgrading version 2 snapshots.
 - Add an API endpoint for audit review.
 
+### Phase 6: SQLite Persistence
+
+Status: complete.
+
+- Add a SQLite persistence backend with `schema_migrations`.
+- Store full application state in a durable `app_state` snapshot table.
+- Add SQLite round-trip and migration tests.
+- Add CLI commands for `save_sqlite` and `load_sqlite`.
+
 ### Future Hardening
 
 Planned:
 
-- Replace JSON persistence with SQLite/Postgres migrations.
+- Normalize SQLite persistence into account, transaction, customer, user, and audit tables.
+- Add Postgres support and production-grade migrations.
 - Add request IDs and structured tracing/log output.
 - Add rate limiting and account lockout for failed logins.
 - Replace Basic auth with signed session tokens for the API.

@@ -5,6 +5,7 @@ pub mod bank;
 pub mod cli;
 pub mod domain;
 pub mod identity;
+pub mod sqlite_store;
 pub mod storage;
 
 pub use app::AppState;

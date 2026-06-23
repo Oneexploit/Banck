@@ -6,6 +6,7 @@ use crate::{
     bank::{BankError, BankResult},
     domain::{Account, AccountId, CustomerId, InterestRate, Money},
     identity::{IdentityError, IdentityStore, Permission, Role, Session, UserId},
+    sqlite_store::{load_app_from_sqlite_file, save_app_to_sqlite_file},
     storage::{export_bank_statement_file, load_app_from_json_file, save_app_to_json_file},
 };
 
@@ -27,7 +28,7 @@ fn command_line_interface(state: &mut AppState, session: &mut Option<Session>) {
         println!("loan_request, pay_loan");
         println!("balance, info, list, search, history, statement");
         println!("total_balance, richest, empty_accounts, count");
-        println!("save, load, export, audit, exit");
+        println!("save, load, save_sqlite, load_sqlite, export, audit, exit");
 
         let command = read_text("Enter command: ").to_lowercase();
 
@@ -488,6 +489,75 @@ fn command_line_interface(state: &mut AppState, session: &mut Option<Session>) {
                             error.to_string(),
                         );
                         println!("Load failed: {error}");
+                    }
+                }
+            }
+            "save_sqlite" => {
+                if !authorize(session, Permission::PersistState) {
+                    continue;
+                }
+
+                let path = read_text("SQLite file path: ");
+
+                match save_app_to_sqlite_file(state, &path) {
+                    Ok(()) => {
+                        record_cli_audit(
+                            state,
+                            session,
+                            AuditAction::SaveState,
+                            AuditOutcome::Success,
+                            Some(path),
+                            "state saved to sqlite",
+                        );
+                        println!("Application state saved to SQLite");
+                    }
+                    Err(error) => {
+                        record_cli_audit(
+                            state,
+                            session,
+                            AuditAction::SaveState,
+                            AuditOutcome::Failure,
+                            Some(path),
+                            error.to_string(),
+                        );
+                        println!("SQLite save failed: {error}");
+                    }
+                }
+            }
+            "load_sqlite" => {
+                if session.is_some() && !authorize(session, Permission::PersistState) {
+                    continue;
+                }
+
+                let path = read_text("SQLite file path: ");
+
+                match load_app_from_sqlite_file(&path) {
+                    Ok(loaded_state) => {
+                        *state = loaded_state;
+                        *session = None;
+                        record_cli_audit(
+                            state,
+                            session,
+                            AuditAction::LoadState,
+                            AuditOutcome::Success,
+                            Some(path),
+                            "state loaded from sqlite",
+                        );
+                        println!(
+                            "Application state loaded from SQLite. Account count: {}. Please log in again.",
+                            state.bank.account_count()
+                        );
+                    }
+                    Err(error) => {
+                        record_cli_audit(
+                            state,
+                            session,
+                            AuditAction::LoadState,
+                            AuditOutcome::Failure,
+                            Some(path),
+                            error.to_string(),
+                        );
+                        println!("SQLite load failed: {error}");
                     }
                 }
             }
