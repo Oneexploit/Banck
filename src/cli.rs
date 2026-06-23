@@ -1,11 +1,9 @@
-use std::{
-    fs,
-    io::{self, Write},
-};
+use std::io::{self, Write};
 
 use crate::{
     bank::{Bank, BankError, BankResult},
     domain::{Account, AccountId, InterestRate, Money},
+    storage::{export_bank_statement_file, load_bank_from_json_file, save_bank_to_json_file},
 };
 
 pub fn run() {
@@ -21,7 +19,8 @@ fn command_line_interface(bank: &mut Bank) {
         println!("deposit, withdraw, transfer, fee, monthly_fee, interest");
         println!("loan_request, pay_loan");
         println!("balance, info, list, search, history, statement");
-        println!("total_balance, richest, empty_accounts, count, save, exit");
+        println!("total_balance, richest, empty_accounts, count");
+        println!("save, load, export, exit");
 
         let command = read_text("Enter command: ").to_lowercase();
 
@@ -157,11 +156,30 @@ fn command_line_interface(bank: &mut Bank) {
             "empty_accounts" => print_empty_accounts(bank),
             "count" => println!("Account count: {}", bank.account_count()),
             "save" => {
-                let path = read_text("File path: ");
+                let path = read_text("JSON file path: ");
 
-                match save_accounts(bank, &path) {
-                    Ok(()) => println!("Accounts saved"),
+                match save_bank_to_json_file(bank, &path) {
+                    Ok(()) => println!("Bank state saved"),
                     Err(error) => println!("Save failed: {error}"),
+                }
+            }
+            "load" => {
+                let path = read_text("JSON file path: ");
+
+                match load_bank_from_json_file(&path) {
+                    Ok(loaded_bank) => {
+                        *bank = loaded_bank;
+                        println!("Bank state loaded. Account count: {}", bank.account_count());
+                    }
+                    Err(error) => println!("Load failed: {error}"),
+                }
+            }
+            "export" => {
+                let path = read_text("Statement file path: ");
+
+                match export_bank_statement_file(bank, &path) {
+                    Ok(()) => println!("Statement exported"),
+                    Err(error) => println!("Export failed: {error}"),
                 }
             }
             "exit" => {
@@ -227,25 +245,6 @@ fn print_account_statement(account: &Account) {
             transaction.description()
         );
     }
-}
-
-fn save_accounts(bank: &Bank, path: &str) -> io::Result<()> {
-    let mut output = String::new();
-
-    for account in bank.accounts() {
-        output.push_str(&format!("{}\n", account_info(account)));
-
-        for transaction in account.transactions() {
-            output.push_str(&format!(
-                "  - {} | {} | {}\n",
-                transaction.kind(),
-                transaction.amount(),
-                transaction.description()
-            ));
-        }
-    }
-
-    fs::write(path, output)
 }
 
 fn print_result(result: BankResult<()>, success_message: &str) {

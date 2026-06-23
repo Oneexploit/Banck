@@ -1,8 +1,13 @@
 use std::{error::Error, fmt, str::FromStr};
 
+use serde::{Deserialize, Serialize};
+
 pub type AccountId = u32;
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(transparent)]
 pub struct Money {
     cents: i64,
 }
@@ -165,7 +170,8 @@ impl fmt::Display for MoneyParseError {
 
 impl Error for MoneyParseError {}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct InterestRate {
     basis_points: u32,
 }
@@ -288,7 +294,8 @@ impl fmt::Display for InterestRateParseError {
 
 impl Error for InterestRateParseError {}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AccountStatus {
     Active,
     Inactive,
@@ -305,7 +312,8 @@ impl fmt::Display for AccountStatus {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TransactionKind {
     AccountCreated,
     Deposit,
@@ -342,7 +350,7 @@ impl fmt::Display for TransactionKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Transaction {
     kind: TransactionKind,
     amount: Money,
@@ -371,7 +379,7 @@ impl Transaction {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Account {
     pub(crate) id: AccountId,
     pub(crate) name: String,

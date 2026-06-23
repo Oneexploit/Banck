@@ -84,6 +84,21 @@ impl Bank {
         Self::default()
     }
 
+    pub fn from_accounts(accounts: Vec<Account>) -> BankResult<Self> {
+        let mut bank = Self::new();
+
+        for account in accounts {
+            validate_imported_account(&account)?;
+            let account_id = account.id;
+
+            if bank.accounts.insert(account_id, account).is_some() {
+                return Err(BankError::AccountAlreadyExists(account_id));
+            }
+        }
+
+        Ok(bank)
+    }
+
     pub fn account_count(&self) -> usize {
         self.accounts.len()
     }
@@ -513,6 +528,15 @@ fn ensure_non_negative(amount: Money) -> BankResult<()> {
     if amount.is_negative() {
         return Err(BankError::InvalidAmount);
     }
+
+    Ok(())
+}
+
+fn validate_imported_account(account: &Account) -> BankResult<()> {
+    clean_name(account.name.clone())?;
+    clean_email(account.email.clone())?;
+    ensure_non_negative(account.balance)?;
+    ensure_non_negative(account.loan_balance)?;
 
     Ok(())
 }

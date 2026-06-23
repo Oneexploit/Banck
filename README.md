@@ -17,12 +17,13 @@ Status: complete.
 
 ### Phase 2: Durable Storage
 
-Planned:
+Status: complete.
 
 - Add structured serialization with `serde`.
 - Load and save accounts from JSON first, then prepare for SQLite/Postgres.
 - Separate exportable statements from internal application state.
 - Add tests for persistence and corrupted input handling.
+- Add CLI commands for `save`, `load`, and `export`.
 
 ### Phase 3: Security and Identity
 
