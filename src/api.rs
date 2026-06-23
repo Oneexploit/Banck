@@ -13,6 +13,7 @@ use tokio::{net::TcpListener, sync::RwLock};
 
 use crate::{
     app::AppState,
+    audit::{AuditAction, AuditActor, AuditEntry, AuditOutcome},
     bank::{BankError, BankResult},
     domain::{Account, AccountId, CustomerId, Money, Transaction},
     identity::{Customer, IdentityError, IdentityStore, Permission, Role, Session, User, UserId},
@@ -46,6 +47,7 @@ pub fn router(app: AppState) -> Router {
         .route("/accounts/{id}/loans", post(request_loan))
         .route("/accounts/{id}/loan-payments", post(pay_loan))
         .route("/transfers", post(transfer))
+        .route("/audit", get(list_audit))
         .with_state(ApiState::new(app))
 }
 
@@ -65,25 +67,50 @@ async fn bootstrap_admin(
     let mut app = state.app.write().await;
 
     if app.identities.has_users() {
+        record_audit(
+            &mut app,
+            AuditActor::System,
+            AuditAction::BootstrapAdmin,
+            AuditOutcome::Failure,
+            None,
+            "bootstrap attempted after users already exist",
+        )?;
         return Err(ApiError::conflict(
             "bootstrap is only available before users exist",
         ));
     }
 
-    app.identities
-        .create_user(
-            payload.user_id,
-            payload.username.clone(),
-            Role::Admin,
-            None,
-            &payload.password,
-        )
-        .map_err(ApiError::from_identity)?;
+    if let Err(error) = app.identities.create_user(
+        payload.user_id,
+        payload.username.clone(),
+        Role::Admin,
+        None,
+        &payload.password,
+    ) {
+        let message = error.to_string();
+        record_audit(
+            &mut app,
+            AuditActor::System,
+            AuditAction::BootstrapAdmin,
+            AuditOutcome::Failure,
+            Some(format!("user:{}", payload.user_id)),
+            message.clone(),
+        )?;
+        return Err(ApiError::from_identity(error));
+    }
 
     let session = app
         .identities
         .authenticate(payload.username, &payload.password)
         .map_err(ApiError::from_identity)?;
+    record_audit(
+        &mut app,
+        AuditActor::from_session(&session),
+        AuditAction::BootstrapAdmin,
+        AuditOutcome::Success,
+        Some(format!("user:{}", session.user_id())),
+        "admin bootstrapped",
+    )?;
 
     Ok(Json(SessionResponse::from_session(&session)))
 }
@@ -92,11 +119,35 @@ async fn login(
     State(state): State<ApiState>,
     Json(payload): Json<LoginRequest>,
 ) -> Result<Json<SessionResponse>, ApiError> {
-    let app = state.app.read().await;
-    let session = app
+    let mut app = state.app.write().await;
+    let session = match app
         .identities
-        .authenticate(payload.username, &payload.password)
-        .map_err(ApiError::from_identity)?;
+        .authenticate(&payload.username, &payload.password)
+    {
+        Ok(session) => {
+            record_audit(
+                &mut app,
+                AuditActor::from_session(&session),
+                AuditAction::Login,
+                AuditOutcome::Success,
+                Some(format!("user:{}", session.user_id())),
+                "login succeeded",
+            )?;
+            session
+        }
+        Err(error) => {
+            let message = error.to_string();
+            record_audit(
+                &mut app,
+                AuditActor::System,
+                AuditAction::Login,
+                AuditOutcome::Failure,
+                Some(format!("username:{}", payload.username)),
+                message,
+            )?;
+            return Err(ApiError::from_identity(error));
+        }
+    };
 
     Ok(Json(SessionResponse::from_session(&session)))
 }
@@ -109,12 +160,40 @@ async fn create_customer(
     let mut app = state.app.write().await;
     let session = authenticate_request(&app, &headers)?;
     authorize(&session, Permission::ManageIdentity)?;
-    let customer = app
-        .identities
-        .create_customer(payload.id, payload.full_name, payload.email)
-        .map_err(ApiError::from_identity)?;
+    let response = {
+        let customer = app
+            .identities
+            .create_customer(payload.id, payload.full_name, payload.email)
+            .map_err(ApiError::from_identity)?;
+        CustomerResponse::from_customer(customer)
+    };
+    record_audit(
+        &mut app,
+        AuditActor::from_session(&session),
+        AuditAction::CreateCustomer,
+        AuditOutcome::Success,
+        Some(format!("customer:{}", response.id)),
+        "customer created",
+    )?;
 
-    Ok(Json(CustomerResponse::from_customer(customer)))
+    Ok(Json(response))
+}
+
+async fn list_audit(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<AuditEntryResponse>>, ApiError> {
+    let app = state.app.read().await;
+    let session = authenticate_request(&app, &headers)?;
+    authorize(&session, Permission::ManageIdentity)?;
+    let entries = app
+        .audit_log
+        .entries()
+        .iter()
+        .map(AuditEntryResponse::from_entry)
+        .collect();
+
+    Ok(Json(entries))
 }
 
 async fn list_customers(
@@ -141,18 +220,29 @@ async fn create_user(
     let mut app = state.app.write().await;
     let session = authenticate_request(&app, &headers)?;
     authorize(&session, Permission::ManageIdentity)?;
-    let user = app
-        .identities
-        .create_user(
-            payload.id,
-            payload.username,
-            payload.role,
-            payload.customer_id,
-            &payload.password,
-        )
-        .map_err(ApiError::from_identity)?;
+    let response = {
+        let user = app
+            .identities
+            .create_user(
+                payload.id,
+                payload.username,
+                payload.role,
+                payload.customer_id,
+                &payload.password,
+            )
+            .map_err(ApiError::from_identity)?;
+        UserResponse::from_user(user)
+    };
+    record_audit(
+        &mut app,
+        AuditActor::from_session(&session),
+        AuditAction::CreateUser,
+        AuditOutcome::Success,
+        Some(format!("user:{}", response.id)),
+        "user created",
+    )?;
 
-    Ok(Json(UserResponse::from_user(user)))
+    Ok(Json(response))
 }
 
 async fn list_users(
@@ -197,8 +287,17 @@ async fn create_account(
         )
         .map_err(ApiError::from_bank)?;
     let account = app.bank.account(payload.id).map_err(ApiError::from_bank)?;
+    let response = AccountResponse::from_account(account);
+    record_audit(
+        &mut app,
+        AuditActor::from_session(&session),
+        AuditAction::CreateAccount,
+        AuditOutcome::Success,
+        Some(format!("account:{}", response.id)),
+        "account created",
+    )?;
 
-    Ok(Json(AccountResponse::from_account(account)))
+    Ok(Json(response))
 }
 
 async fn list_accounts(
@@ -236,6 +335,7 @@ async fn deposit(
         headers,
         account_id,
         payload.amount_cents,
+        AuditAction::Deposit,
         |app, id, amount| app.bank.deposit(id, amount),
     )
     .await
@@ -252,6 +352,7 @@ async fn withdraw(
         headers,
         account_id,
         payload.amount_cents,
+        AuditAction::Withdraw,
         |app, id, amount| app.bank.withdraw(id, amount),
     )
     .await
@@ -271,8 +372,17 @@ async fn apply_fee(
         .apply_fee(account_id, amount)
         .map_err(ApiError::from_bank)?;
     let account = app.bank.account(account_id).map_err(ApiError::from_bank)?;
+    let response = AccountResponse::from_account(account);
+    record_audit(
+        &mut app,
+        AuditActor::from_session(&session),
+        AuditAction::Fee,
+        AuditOutcome::Success,
+        Some(format!("account:{account_id}")),
+        "fee applied",
+    )?;
 
-    Ok(Json(AccountResponse::from_account(account)))
+    Ok(Json(response))
 }
 
 async fn request_loan(
@@ -289,8 +399,17 @@ async fn request_loan(
         .request_loan(account_id, amount)
         .map_err(ApiError::from_bank)?;
     let account = app.bank.account(account_id).map_err(ApiError::from_bank)?;
+    let response = AccountResponse::from_account(account);
+    record_audit(
+        &mut app,
+        AuditActor::from_session(&session),
+        AuditAction::LoanRequest,
+        AuditOutcome::Success,
+        Some(format!("account:{account_id}")),
+        "loan requested",
+    )?;
 
-    Ok(Json(AccountResponse::from_account(account)))
+    Ok(Json(response))
 }
 
 async fn pay_loan(
@@ -307,8 +426,17 @@ async fn pay_loan(
         .pay_loan(account_id, amount)
         .map_err(ApiError::from_bank)?;
     let account = app.bank.account(account_id).map_err(ApiError::from_bank)?;
+    let response = AccountResponse::from_account(account);
+    record_audit(
+        &mut app,
+        AuditActor::from_session(&session),
+        AuditAction::LoanPayment,
+        AuditOutcome::Success,
+        Some(format!("account:{account_id}")),
+        "loan payment made",
+    )?;
 
-    Ok(Json(AccountResponse::from_account(account)))
+    Ok(Json(response))
 }
 
 async fn transfer(
@@ -331,11 +459,23 @@ async fn transfer(
         .bank
         .account(payload.to_account_id)
         .map_err(ApiError::from_bank)?;
-
-    Ok(Json(TransferResponse {
+    let response = TransferResponse {
         from: AccountResponse::from_account(from_account),
         to: AccountResponse::from_account(to_account),
-    }))
+    };
+    record_audit(
+        &mut app,
+        AuditActor::from_session(&session),
+        AuditAction::Transfer,
+        AuditOutcome::Success,
+        Some(format!(
+            "account:{}->account:{}",
+            payload.from_account_id, payload.to_account_id
+        )),
+        "transfer completed",
+    )?;
+
+    Ok(Json(response))
 }
 
 async fn mutate_account_money(
@@ -343,6 +483,7 @@ async fn mutate_account_money(
     headers: HeaderMap,
     account_id: AccountId,
     amount_cents: i64,
+    action: AuditAction,
     operation: impl FnOnce(&mut AppState, AccountId, Money) -> BankResult<()>,
 ) -> Result<Json<AccountResponse>, ApiError> {
     let mut app = state.app.write().await;
@@ -351,8 +492,17 @@ async fn mutate_account_money(
     let amount = money_from_cents(amount_cents)?;
     operation(&mut app, account_id, amount).map_err(ApiError::from_bank)?;
     let account = app.bank.account(account_id).map_err(ApiError::from_bank)?;
+    let response = AccountResponse::from_account(account);
+    record_audit(
+        &mut app,
+        AuditActor::from_session(&session),
+        action,
+        AuditOutcome::Success,
+        Some(format!("account:{account_id}")),
+        format!("{action} completed"),
+    )?;
 
-    Ok(Json(AccountResponse::from_account(account)))
+    Ok(Json(response))
 }
 
 fn authenticate_request(app: &AppState, headers: &HeaderMap) -> Result<Session, ApiError> {
@@ -469,6 +619,20 @@ fn money_from_cents(cents: i64) -> Result<Money, ApiError> {
     Ok(Money::from_cents(cents))
 }
 
+fn record_audit(
+    app: &mut AppState,
+    actor: AuditActor,
+    action: AuditAction,
+    outcome: AuditOutcome,
+    target: Option<String>,
+    message: impl Into<String>,
+) -> Result<(), ApiError> {
+    app.audit_log
+        .record(actor, action, outcome, target, message)
+        .map(|_| ())
+        .map_err(|error| ApiError::internal_server_error(error.to_string()))
+}
+
 fn non_negative_money_from_cents(cents: i64) -> Result<Money, ApiError> {
     if cents < 0 {
         return Err(ApiError::bad_request(
@@ -514,6 +678,13 @@ impl ApiError {
         }
     }
 
+    fn internal_server_error(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: message.into(),
+        }
+    }
+
     fn from_bank(error: BankError) -> Self {
         let status = match error {
             BankError::AccountNotFound(_) => StatusCode::NOT_FOUND,
@@ -524,6 +695,9 @@ impl ApiError {
                 StatusCode::CONFLICT
             }
             BankError::ArithmeticOverflow => StatusCode::INTERNAL_SERVER_ERROR,
+            BankError::DuplicateTransactionId(_) | BankError::InvalidTransactionId(_) => {
+                StatusCode::BAD_REQUEST
+            }
             BankError::SameAccountTransfer(_)
             | BankError::InvalidAmount
             | BankError::InvalidProfileField(_)
@@ -722,6 +896,8 @@ impl AccountResponse {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct TransactionResponse {
+    id: u64,
+    occurred_at_epoch_seconds: u64,
     kind: String,
     amount_cents: i64,
     amount: String,
@@ -731,6 +907,8 @@ struct TransactionResponse {
 impl TransactionResponse {
     fn from_transaction(transaction: &Transaction) -> Self {
         Self {
+            id: transaction.id(),
+            occurred_at_epoch_seconds: transaction.occurred_at_epoch_seconds(),
             kind: transaction.kind().to_string(),
             amount_cents: transaction.amount().cents(),
             amount: transaction.amount().to_string(),
@@ -743,6 +921,31 @@ impl TransactionResponse {
 struct TransferResponse {
     from: AccountResponse,
     to: AccountResponse,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct AuditEntryResponse {
+    id: u64,
+    occurred_at_epoch_seconds: u64,
+    actor: String,
+    action: String,
+    outcome: String,
+    target: Option<String>,
+    message: String,
+}
+
+impl AuditEntryResponse {
+    fn from_entry(entry: &AuditEntry) -> Self {
+        Self {
+            id: entry.id(),
+            occurred_at_epoch_seconds: entry.occurred_at_epoch_seconds(),
+            actor: entry.actor().to_string(),
+            action: entry.action().to_string(),
+            outcome: entry.outcome().to_string(),
+            target: entry.target().map(ToString::to_string),
+            message: entry.message().to_string(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1011,5 +1214,53 @@ mod tests {
         let body = response_json(response).await;
         assert_eq!(body["from"]["balance_cents"], 7500);
         assert_eq!(body["to"]["balance_cents"], 3000);
+    }
+
+    #[tokio::test]
+    async fn audit_endpoint_returns_recorded_events() {
+        let app = router(AppState::new());
+
+        request(
+            app.clone(),
+            "POST",
+            "/auth/bootstrap-admin",
+            None,
+            json!({
+                "user_id": 1,
+                "username": "admin",
+                "password": "correct-password"
+            }),
+        )
+        .await;
+        request(
+            app.clone(),
+            "POST",
+            "/accounts",
+            Some(("admin", "correct-password")),
+            json!({
+                "id": 100,
+                "owner_id": null,
+                "name": "Operations",
+                "email": "ops@example.com",
+                "opening_balance_cents": 10000
+            }),
+        )
+        .await;
+
+        let response = request(
+            app,
+            "GET",
+            "/audit",
+            Some(("admin", "correct-password")),
+            json!({}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        let entries = body.as_array().unwrap();
+
+        assert!(entries.len() >= 2);
+        assert_eq!(entries[0]["action"], "bootstrap_admin");
+        assert_eq!(entries[1]["action"], "create_account");
     }
 }

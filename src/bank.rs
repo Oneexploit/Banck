@@ -1,8 +1,12 @@
-use std::{collections::BTreeMap, error::Error, fmt};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    error::Error,
+    fmt,
+};
 
 use crate::domain::{
-    Account, AccountId, AccountStatus, CustomerId, InterestRate, Money, Transaction,
-    TransactionKind,
+    Account, AccountId, AccountStatus, CustomerId, InterestRate, Money, Transaction, TransactionId,
+    TransactionKind, current_epoch_seconds,
 };
 
 pub type BankResult<T> = Result<T, BankError>;
@@ -31,6 +35,8 @@ pub enum BankError {
     },
     NoLoan(AccountId),
     ArithmeticOverflow,
+    InvalidTransactionId(TransactionId),
+    DuplicateTransactionId(TransactionId),
 }
 
 impl fmt::Display for BankError {
@@ -69,15 +75,29 @@ impl fmt::Display for BankError {
             ),
             Self::NoLoan(id) => write!(formatter, "account {id} has no outstanding loan"),
             Self::ArithmeticOverflow => write!(formatter, "calculation overflowed"),
+            Self::InvalidTransactionId(id) => write!(formatter, "transaction id {id} is invalid"),
+            Self::DuplicateTransactionId(id) => {
+                write!(formatter, "transaction id {id} is duplicated")
+            }
         }
     }
 }
 
 impl Error for BankError {}
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Bank {
     accounts: BTreeMap<AccountId, Account>,
+    next_transaction_id: TransactionId,
+}
+
+impl Default for Bank {
+    fn default() -> Self {
+        Self {
+            accounts: BTreeMap::new(),
+            next_transaction_id: 1,
+        }
+    }
 }
 
 impl Bank {
@@ -87,15 +107,35 @@ impl Bank {
 
     pub fn from_accounts(accounts: Vec<Account>) -> BankResult<Self> {
         let mut bank = Self::new();
+        let mut seen_transaction_ids = BTreeSet::new();
+        let mut max_transaction_id = 0;
 
         for account in accounts {
             validate_imported_account(&account)?;
             let account_id = account.id;
 
+            for transaction in account.transactions() {
+                let transaction_id = transaction.id();
+
+                if transaction_id == 0 {
+                    return Err(BankError::InvalidTransactionId(transaction_id));
+                }
+
+                if !seen_transaction_ids.insert(transaction_id) {
+                    return Err(BankError::DuplicateTransactionId(transaction_id));
+                }
+
+                max_transaction_id = max_transaction_id.max(transaction_id);
+            }
+
             if bank.accounts.insert(account_id, account).is_some() {
                 return Err(BankError::AccountAlreadyExists(account_id));
             }
         }
+
+        bank.next_transaction_id = max_transaction_id
+            .checked_add(1)
+            .ok_or(BankError::ArithmeticOverflow)?;
 
         Ok(bank)
     }
@@ -128,7 +168,12 @@ impl Bank {
 
         let name = clean_name(name.into())?;
         let email = clean_email(email.into())?;
-        let account = Account::new(id, owner_id, name, email, opening_balance);
+        let mut account = Account::new(id, owner_id, name, email, opening_balance);
+        account.record(self.next_transaction(
+            TransactionKind::AccountCreated,
+            opening_balance,
+            "Account created",
+        )?);
 
         self.accounts.insert(id, account);
         Ok(self.accounts.get(&id).expect("inserted account must exist"))
@@ -140,28 +185,29 @@ impl Bank {
 
     pub fn update_name(&mut self, id: AccountId, name: impl Into<String>) -> BankResult<()> {
         let name = clean_name(name.into())?;
+        self.account(id)?;
+        let transaction =
+            self.next_transaction(TransactionKind::ProfileUpdated, Money::ZERO, "Name updated")?;
         let account = self.account_mut(id)?;
 
         account.name = name;
-        account.record(Transaction::new(
-            TransactionKind::ProfileUpdated,
-            Money::ZERO,
-            "Name updated",
-        ));
+        account.record(transaction);
 
         Ok(())
     }
 
     pub fn update_email(&mut self, id: AccountId, email: impl Into<String>) -> BankResult<()> {
         let email = clean_email(email.into())?;
-        let account = self.account_mut(id)?;
-
-        account.email = email;
-        account.record(Transaction::new(
+        self.account(id)?;
+        let transaction = self.next_transaction(
             TransactionKind::ProfileUpdated,
             Money::ZERO,
             "Email updated",
-        ));
+        )?;
+        let account = self.account_mut(id)?;
+
+        account.email = email;
+        account.record(transaction);
 
         Ok(())
     }
@@ -173,12 +219,12 @@ impl Bank {
             return Err(BankError::AccountClosed(id));
         }
 
+        let transaction =
+            self.next_transaction(TransactionKind::Activated, Money::ZERO, "Account activated")?;
+
+        let account = self.account_mut(id)?;
         account.status = AccountStatus::Active;
-        account.record(Transaction::new(
-            TransactionKind::Activated,
-            Money::ZERO,
-            "Account activated",
-        ));
+        account.record(transaction);
 
         Ok(())
     }
@@ -190,12 +236,15 @@ impl Bank {
             return Err(BankError::AccountClosed(id));
         }
 
-        account.status = AccountStatus::Inactive;
-        account.record(Transaction::new(
+        let transaction = self.next_transaction(
             TransactionKind::Deactivated,
             Money::ZERO,
             "Account deactivated",
-        ));
+        )?;
+
+        let account = self.account_mut(id)?;
+        account.status = AccountStatus::Inactive;
+        account.record(transaction);
 
         Ok(())
     }
@@ -217,12 +266,12 @@ impl Bank {
             });
         }
 
+        let transaction =
+            self.next_transaction(TransactionKind::Closed, Money::ZERO, "Account closed")?;
+
+        let account = self.account_mut(id)?;
         account.status = AccountStatus::Closed;
-        account.record(Transaction::new(
-            TransactionKind::Closed,
-            Money::ZERO,
-            "Account closed",
-        ));
+        account.record(transaction);
 
         Ok(())
     }
@@ -253,16 +302,14 @@ impl Bank {
         ensure_positive(amount)?;
         self.ensure_can_transact(id)?;
 
+        let transaction =
+            self.next_transaction(TransactionKind::Deposit, amount, "Money deposited")?;
         let account = self.account_mut(id)?;
         account.balance = account
             .balance
             .checked_add(amount)
             .ok_or(BankError::ArithmeticOverflow)?;
-        account.record(Transaction::new(
-            TransactionKind::Deposit,
-            amount,
-            "Money deposited",
-        ));
+        account.record(transaction);
 
         Ok(())
     }
@@ -272,16 +319,14 @@ impl Bank {
         self.ensure_can_transact(id)?;
         self.ensure_sufficient_funds(id, amount)?;
 
+        let transaction =
+            self.next_transaction(TransactionKind::Withdrawal, amount, "Money withdrawn")?;
         let account = self.account_mut(id)?;
         account.balance = account
             .balance
             .checked_sub(amount)
             .ok_or(BankError::ArithmeticOverflow)?;
-        account.record(Transaction::new(
-            TransactionKind::Withdrawal,
-            amount,
-            "Money withdrawn",
-        ));
+        account.record(transaction);
 
         Ok(())
     }
@@ -310,25 +355,27 @@ impl Bank {
         let next_to_balance = to_balance
             .checked_add(amount)
             .ok_or(BankError::ArithmeticOverflow)?;
+        let transfer_out = self.next_transaction(
+            TransactionKind::TransferOut,
+            amount,
+            format!("Transferred to account {to_id}"),
+        )?;
+        let transfer_in = self.next_transaction(
+            TransactionKind::TransferIn,
+            amount,
+            format!("Received from account {from_id}"),
+        )?;
 
         {
             let from_account = self.account_mut(from_id)?;
             from_account.balance = next_from_balance;
-            from_account.record(Transaction::new(
-                TransactionKind::TransferOut,
-                amount,
-                format!("Transferred to account {to_id}"),
-            ));
+            from_account.record(transfer_out);
         }
 
         {
             let to_account = self.account_mut(to_id)?;
             to_account.balance = next_to_balance;
-            to_account.record(Transaction::new(
-                TransactionKind::TransferIn,
-                amount,
-                format!("Received from account {from_id}"),
-            ));
+            to_account.record(transfer_in);
         }
 
         Ok(())
@@ -339,16 +386,14 @@ impl Bank {
         self.ensure_can_transact(id)?;
         self.ensure_sufficient_funds(id, amount)?;
 
+        let transaction =
+            self.next_transaction(TransactionKind::Fee, amount, "Bank fee applied")?;
         let account = self.account_mut(id)?;
         account.balance = account
             .balance
             .checked_sub(amount)
             .ok_or(BankError::ArithmeticOverflow)?;
-        account.record(Transaction::new(
-            TransactionKind::Fee,
-            amount,
-            "Bank fee applied",
-        ));
+        account.record(transaction);
 
         Ok(())
     }
@@ -374,17 +419,18 @@ impl Bank {
             .balance
             .checked_percentage(rate)
             .ok_or(BankError::ArithmeticOverflow)?;
+        let transaction = self.next_transaction(
+            TransactionKind::Interest,
+            interest,
+            format!("Interest added at {rate}"),
+        )?;
 
         let account = self.account_mut(id)?;
         account.balance = account
             .balance
             .checked_add(interest)
             .ok_or(BankError::ArithmeticOverflow)?;
-        account.record(Transaction::new(
-            TransactionKind::Interest,
-            interest,
-            format!("Interest added at {rate}"),
-        ));
+        account.record(transaction);
 
         Ok(interest)
     }
@@ -393,6 +439,8 @@ impl Bank {
         ensure_positive(amount)?;
         self.ensure_can_transact(id)?;
 
+        let transaction =
+            self.next_transaction(TransactionKind::LoanRequested, amount, "Loan received")?;
         let account = self.account_mut(id)?;
         account.balance = account
             .balance
@@ -402,11 +450,7 @@ impl Bank {
             .loan_balance
             .checked_add(amount)
             .ok_or(BankError::ArithmeticOverflow)?;
-        account.record(Transaction::new(
-            TransactionKind::LoanRequested,
-            amount,
-            "Loan received",
-        ));
+        account.record(transaction);
 
         Ok(())
     }
@@ -431,6 +475,8 @@ impl Bank {
             });
         }
 
+        let transaction =
+            self.next_transaction(TransactionKind::LoanPayment, payment, "Loan payment made")?;
         let account = self.account_mut(id)?;
         account.balance = account
             .balance
@@ -440,11 +486,7 @@ impl Bank {
             .loan_balance
             .checked_sub(payment)
             .ok_or(BankError::ArithmeticOverflow)?;
-        account.record(Transaction::new(
-            TransactionKind::LoanPayment,
-            payment,
-            "Loan payment made",
-        ));
+        account.record(transaction);
 
         Ok(payment)
     }
@@ -495,6 +537,27 @@ impl Bank {
         }
 
         Ok(())
+    }
+
+    fn next_transaction(
+        &mut self,
+        kind: TransactionKind,
+        amount: Money,
+        description: impl Into<String>,
+    ) -> BankResult<Transaction> {
+        let transaction_id = self.next_transaction_id;
+        self.next_transaction_id = self
+            .next_transaction_id
+            .checked_add(1)
+            .ok_or(BankError::ArithmeticOverflow)?;
+
+        Ok(Transaction::new(
+            transaction_id,
+            current_epoch_seconds(),
+            kind,
+            amount,
+            description,
+        ))
     }
 }
 
@@ -669,5 +732,26 @@ mod tests {
             .unwrap();
 
         assert_eq!(bank.account(1).unwrap().owner_id(), Some(10));
+    }
+
+    #[test]
+    fn transaction_ids_are_unique_and_increasing() {
+        let mut bank = bank_with_two_accounts();
+
+        bank.transfer(1, 2, money("5.00")).unwrap();
+
+        let first_account_transactions = bank.account(1).unwrap().transactions();
+        let second_account_transactions = bank.account(2).unwrap().transactions();
+        let create_id = first_account_transactions[0].id();
+        let transfer_out_id = first_account_transactions.last().unwrap().id();
+        let transfer_in_id = second_account_transactions.last().unwrap().id();
+
+        assert!(create_id > 0);
+        assert!(transfer_out_id > create_id);
+        assert!(transfer_in_id > transfer_out_id);
+        assert!(
+            first_account_transactions[0].occurred_at_epoch_seconds() > 0,
+            "transactions include a timestamp"
+        );
     }
 }

@@ -1,10 +1,16 @@
-use std::{error::Error, fmt, str::FromStr};
+use std::{
+    error::Error,
+    fmt,
+    str::FromStr,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use serde::{Deserialize, Serialize};
 
 pub use crate::identity::CustomerId;
 
 pub type AccountId = u32;
+pub type TransactionId = u64;
 
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
@@ -354,18 +360,36 @@ impl fmt::Display for TransactionKind {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Transaction {
+    id: TransactionId,
+    occurred_at_epoch_seconds: u64,
     kind: TransactionKind,
     amount: Money,
     description: String,
 }
 
 impl Transaction {
-    pub fn new(kind: TransactionKind, amount: Money, description: impl Into<String>) -> Self {
+    pub fn new(
+        id: TransactionId,
+        occurred_at_epoch_seconds: u64,
+        kind: TransactionKind,
+        amount: Money,
+        description: impl Into<String>,
+    ) -> Self {
         Self {
+            id,
+            occurred_at_epoch_seconds,
             kind,
             amount,
             description: description.into(),
         }
+    }
+
+    pub const fn id(&self) -> TransactionId {
+        self.id
+    }
+
+    pub const fn occurred_at_epoch_seconds(&self) -> u64 {
+        self.occurred_at_epoch_seconds
     }
 
     pub const fn kind(&self) -> TransactionKind {
@@ -401,7 +425,7 @@ impl Account {
         email: impl Into<String>,
         opening_balance: Money,
     ) -> Self {
-        let mut account = Self {
+        Self {
             id,
             owner_id,
             name: name.into(),
@@ -410,15 +434,7 @@ impl Account {
             loan_balance: Money::ZERO,
             status: AccountStatus::Active,
             transactions: Vec::new(),
-        };
-
-        account.record(Transaction::new(
-            TransactionKind::AccountCreated,
-            opening_balance,
-            "Account created",
-        ));
-
-        account
+        }
     }
 
     pub const fn id(&self) -> AccountId {
@@ -464,6 +480,13 @@ impl Account {
     pub(crate) fn record(&mut self, transaction: Transaction) {
         self.transactions.push(transaction);
     }
+}
+
+pub(crate) fn current_epoch_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
 }
 
 #[cfg(test)]

@@ -8,13 +8,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     app::AppState,
+    audit::{AuditEntry, AuditError, AuditLog},
     bank::{Bank, BankError},
     domain::Account,
     identity::{Customer, CustomerId, IdentityError, IdentityStore, User},
 };
 
 const CURRENT_BANK_STORAGE_VERSION: u32 = 1;
-const CURRENT_APP_STORAGE_VERSION: u32 = 2;
+const CURRENT_APP_STORAGE_VERSION: u32 = 3;
+const MIN_SUPPORTED_APP_STORAGE_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct BankSnapshot {
@@ -37,6 +39,8 @@ struct AppSnapshot {
     accounts: Vec<Account>,
     customers: Vec<Customer>,
     users: Vec<User>,
+    #[serde(default)]
+    audit_entries: Vec<AuditEntry>,
 }
 
 impl AppSnapshot {
@@ -46,6 +50,7 @@ impl AppSnapshot {
             accounts: state.bank.accounts().cloned().collect(),
             customers: state.identities.customers().cloned().collect(),
             users: state.identities.users().cloned().collect(),
+            audit_entries: state.audit_log.entries().to_vec(),
         }
     }
 }
@@ -60,6 +65,7 @@ pub enum StorageError {
     UnsupportedVersion(u32),
     InvalidBankState(BankError),
     InvalidIdentityState(IdentityError),
+    InvalidAuditState(AuditError),
     InvalidAccountOwner {
         account_id: u32,
         customer_id: CustomerId,
@@ -78,6 +84,7 @@ impl fmt::Display for StorageError {
             Self::InvalidIdentityState(source) => {
                 write!(formatter, "invalid identity state: {source}")
             }
+            Self::InvalidAuditState(source) => write!(formatter, "invalid audit state: {source}"),
             Self::InvalidAccountOwner {
                 account_id,
                 customer_id,
@@ -96,6 +103,7 @@ impl Error for StorageError {
             Self::Json(source) => Some(source),
             Self::InvalidBankState(source) => Some(source),
             Self::InvalidIdentityState(source) => Some(source),
+            Self::InvalidAuditState(source) => Some(source),
             Self::UnsupportedVersion(_) => None,
             Self::InvalidAccountOwner { .. } => None,
         }
@@ -125,17 +133,21 @@ pub fn app_to_json(state: &AppState) -> StorageResult<String> {
 pub fn app_from_json(input: &str) -> StorageResult<AppState> {
     let snapshot: AppSnapshot = serde_json::from_str(input).map_err(StorageError::Json)?;
 
-    if snapshot.version != CURRENT_APP_STORAGE_VERSION {
+    if !(MIN_SUPPORTED_APP_STORAGE_VERSION..=CURRENT_APP_STORAGE_VERSION)
+        .contains(&snapshot.version)
+    {
         return Err(StorageError::UnsupportedVersion(snapshot.version));
     }
 
     let identities = IdentityStore::from_records(snapshot.customers, snapshot.users)
         .map_err(StorageError::InvalidIdentityState)?;
     let bank = Bank::from_accounts(snapshot.accounts).map_err(StorageError::InvalidBankState)?;
+    let audit_log =
+        AuditLog::from_entries(snapshot.audit_entries).map_err(StorageError::InvalidAuditState)?;
 
     validate_account_owners(&bank, &identities)?;
 
-    Ok(AppState::from_parts(bank, identities))
+    Ok(AppState::from_parts_with_audit(bank, identities, audit_log))
 }
 
 pub fn save_bank_to_json_file(bank: &Bank, path: impl AsRef<Path>) -> StorageResult<()> {
@@ -186,7 +198,9 @@ pub fn bank_statement_text(bank: &Bank) -> String {
 
         for transaction in account.transactions() {
             output.push_str(&format!(
-                "  - {} | {} | {}\n",
+                "  - #{} | {} | {} | {} | {}\n",
+                transaction.id(),
+                transaction.occurred_at_epoch_seconds(),
                 transaction.kind(),
                 transaction.amount(),
                 transaction.description()
@@ -247,6 +261,7 @@ mod tests {
     };
     use crate::{
         app::AppState,
+        audit::{AuditAction, AuditActor, AuditOutcome},
         bank::{Bank, BankError},
         domain::Money,
         identity::{IdentityStore, Role},
@@ -375,11 +390,22 @@ mod tests {
         )
         .unwrap();
 
-        let state = AppState::from_parts(bank, identities);
+        let mut state = AppState::from_parts(bank, identities);
+        state
+            .audit_log
+            .record(
+                AuditActor::System,
+                AuditAction::CreateAccount,
+                AuditOutcome::Success,
+                Some("account:1".to_string()),
+                "account created",
+            )
+            .unwrap();
         let json = app_to_json(&state).unwrap();
         let restored = app_from_json(&json).unwrap();
 
         assert_eq!(restored.bank.account(1).unwrap().owner_id(), Some(10));
+        assert_eq!(restored.audit_log.entries().len(), 1);
         assert_eq!(
             restored
                 .identities

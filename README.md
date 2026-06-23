@@ -47,12 +47,22 @@ Status: complete.
 
 ### Phase 5: Operational Quality
 
+Status: complete.
+
+- Add CI for formatting, Clippy, tests, and dependency audit checks.
+- Add transaction IDs and timestamps to account transactions.
+- Add an application audit log with actor, action, outcome, target, message, and timestamp.
+- Persist audit entries in the application JSON snapshot and support upgrading version 2 snapshots.
+- Add an API endpoint for audit review.
+
+### Future Hardening
+
 Planned:
 
-- Add CI for formatting, Clippy, tests, and audit checks.
-- Add audit logs and transaction IDs.
-- Add migration strategy for durable storage.
-- Add documentation for setup, commands, and architecture.
+- Replace JSON persistence with SQLite/Postgres migrations.
+- Add request IDs and structured tracing/log output.
+- Add rate limiting and account lockout for failed logins.
+- Replace Basic auth with signed session tokens for the API.
 
 ## Development Checks
 

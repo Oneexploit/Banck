@@ -2,6 +2,7 @@ use std::io::{self, Write};
 
 use crate::{
     app::AppState,
+    audit::{AuditAction, AuditActor, AuditOutcome},
     bank::{BankError, BankResult},
     domain::{Account, AccountId, CustomerId, InterestRate, Money},
     identity::{IdentityError, IdentityStore, Permission, Role, Session, UserId},
@@ -26,7 +27,7 @@ fn command_line_interface(state: &mut AppState, session: &mut Option<Session>) {
         println!("loan_request, pay_loan");
         println!("balance, info, list, search, history, statement");
         println!("total_balance, richest, empty_accounts, count");
-        println!("save, load, export, exit");
+        println!("save, load, export, audit, exit");
 
         let command = read_text("Enter command: ").to_lowercase();
 
@@ -38,6 +39,13 @@ fn command_line_interface(state: &mut AppState, session: &mut Option<Session>) {
                 println!("Logged out");
             }
             "session" => print_session_details(session),
+            "audit" => {
+                if !authorize(session, Permission::ManageIdentity) {
+                    continue;
+                }
+
+                print_audit_log(state);
+            }
             "create_customer" => {
                 if !authorize(session, Permission::ManageIdentity) {
                     continue;
@@ -48,8 +56,28 @@ fn command_line_interface(state: &mut AppState, session: &mut Option<Session>) {
                 let email = read_text("Email: ");
 
                 match state.identities.create_customer(id, full_name, email) {
-                    Ok(_) => println!("Customer created"),
-                    Err(error) => print_identity_error("Customer creation failed", error),
+                    Ok(_) => {
+                        record_cli_audit(
+                            state,
+                            session,
+                            AuditAction::CreateCustomer,
+                            AuditOutcome::Success,
+                            Some(format!("customer:{id}")),
+                            "customer created",
+                        );
+                        println!("Customer created");
+                    }
+                    Err(error) => {
+                        record_cli_audit(
+                            state,
+                            session,
+                            AuditAction::CreateCustomer,
+                            AuditOutcome::Failure,
+                            Some(format!("customer:{id}")),
+                            error.to_string(),
+                        );
+                        print_identity_error("Customer creation failed", error);
+                    }
                 }
             }
             "create_user" => {
@@ -71,8 +99,28 @@ fn command_line_interface(state: &mut AppState, session: &mut Option<Session>) {
                     .identities
                     .create_user(id, username, role, customer_id, &password)
                 {
-                    Ok(_) => println!("User created"),
-                    Err(error) => print_identity_error("User creation failed", error),
+                    Ok(_) => {
+                        record_cli_audit(
+                            state,
+                            session,
+                            AuditAction::CreateUser,
+                            AuditOutcome::Success,
+                            Some(format!("user:{id}")),
+                            "user created",
+                        );
+                        println!("User created");
+                    }
+                    Err(error) => {
+                        record_cli_audit(
+                            state,
+                            session,
+                            AuditAction::CreateUser,
+                            AuditOutcome::Failure,
+                            Some(format!("user:{id}")),
+                            error.to_string(),
+                        );
+                        print_identity_error("User creation failed", error);
+                    }
                 }
             }
             "list_customers" => {
@@ -109,8 +157,28 @@ fn command_line_interface(state: &mut AppState, session: &mut Option<Session>) {
                     .bank
                     .create_account(id, owner_id, name, email, opening_balance)
                 {
-                    Ok(_) => println!("Account created"),
-                    Err(error) => print_bank_error("Create failed", error),
+                    Ok(_) => {
+                        record_cli_audit(
+                            state,
+                            session,
+                            AuditAction::CreateAccount,
+                            AuditOutcome::Success,
+                            Some(format!("account:{id}")),
+                            "account created",
+                        );
+                        println!("Account created");
+                    }
+                    Err(error) => {
+                        record_cli_audit(
+                            state,
+                            session,
+                            AuditAction::CreateAccount,
+                            AuditOutcome::Failure,
+                            Some(format!("account:{id}")),
+                            error.to_string(),
+                        );
+                        print_bank_error("Create failed", error);
+                    }
                 }
             }
             "update_name" => {
@@ -175,7 +243,15 @@ fn command_line_interface(state: &mut AppState, session: &mut Option<Session>) {
                 }
 
                 let amount = read_positive_money("Amount: ");
-                print_bank_result(state.bank.deposit(id, amount), "Deposit completed");
+                let result = state.bank.deposit(id, amount);
+                print_bank_result_with_audit(
+                    state,
+                    session,
+                    result,
+                    "Deposit completed",
+                    AuditAction::Deposit,
+                    Some(format!("account:{id}")),
+                );
             }
             "withdraw" => {
                 let id = read_account_id("Account id: ");
@@ -185,7 +261,15 @@ fn command_line_interface(state: &mut AppState, session: &mut Option<Session>) {
                 }
 
                 let amount = read_positive_money("Amount: ");
-                print_bank_result(state.bank.withdraw(id, amount), "Withdraw completed");
+                let result = state.bank.withdraw(id, amount);
+                print_bank_result_with_audit(
+                    state,
+                    session,
+                    result,
+                    "Withdraw completed",
+                    AuditAction::Withdraw,
+                    Some(format!("account:{id}")),
+                );
             }
             "transfer" => {
                 let from_id = read_account_id("From account id: ");
@@ -196,9 +280,14 @@ fn command_line_interface(state: &mut AppState, session: &mut Option<Session>) {
 
                 let to_id = read_account_id("To account id: ");
                 let amount = read_positive_money("Amount: ");
-                print_bank_result(
-                    state.bank.transfer(from_id, to_id, amount),
+                let result = state.bank.transfer(from_id, to_id, amount);
+                print_bank_result_with_audit(
+                    state,
+                    session,
+                    result,
                     "Transfer completed",
+                    AuditAction::Transfer,
+                    Some(format!("account:{from_id}->account:{to_id}")),
                 );
             }
             "fee" => {
@@ -341,8 +430,28 @@ fn command_line_interface(state: &mut AppState, session: &mut Option<Session>) {
                 let path = read_text("JSON file path: ");
 
                 match save_app_to_json_file(state, &path) {
-                    Ok(()) => println!("Application state saved"),
-                    Err(error) => println!("Save failed: {error}"),
+                    Ok(()) => {
+                        record_cli_audit(
+                            state,
+                            session,
+                            AuditAction::SaveState,
+                            AuditOutcome::Success,
+                            Some(path),
+                            "state saved",
+                        );
+                        println!("Application state saved");
+                    }
+                    Err(error) => {
+                        record_cli_audit(
+                            state,
+                            session,
+                            AuditAction::SaveState,
+                            AuditOutcome::Failure,
+                            Some(path),
+                            error.to_string(),
+                        );
+                        println!("Save failed: {error}");
+                    }
                 }
             }
             "load" => {
@@ -356,12 +465,30 @@ fn command_line_interface(state: &mut AppState, session: &mut Option<Session>) {
                     Ok(loaded_state) => {
                         *state = loaded_state;
                         *session = None;
+                        record_cli_audit(
+                            state,
+                            session,
+                            AuditAction::LoadState,
+                            AuditOutcome::Success,
+                            Some(path),
+                            "state loaded",
+                        );
                         println!(
                             "Application state loaded. Account count: {}. Please log in again.",
                             state.bank.account_count()
                         );
                     }
-                    Err(error) => println!("Load failed: {error}"),
+                    Err(error) => {
+                        record_cli_audit(
+                            state,
+                            session,
+                            AuditAction::LoadState,
+                            AuditOutcome::Failure,
+                            Some(path),
+                            error.to_string(),
+                        );
+                        println!("Load failed: {error}");
+                    }
                 }
             }
             "export" => {
@@ -372,8 +499,28 @@ fn command_line_interface(state: &mut AppState, session: &mut Option<Session>) {
                 let path = read_text("Statement file path: ");
 
                 match export_bank_statement_file(&state.bank, &path) {
-                    Ok(()) => println!("Statement exported"),
-                    Err(error) => println!("Export failed: {error}"),
+                    Ok(()) => {
+                        record_cli_audit(
+                            state,
+                            session,
+                            AuditAction::ExportStatement,
+                            AuditOutcome::Success,
+                            Some(path),
+                            "statement exported",
+                        );
+                        println!("Statement exported");
+                    }
+                    Err(error) => {
+                        record_cli_audit(
+                            state,
+                            session,
+                            AuditAction::ExportStatement,
+                            AuditOutcome::Failure,
+                            Some(path),
+                            error.to_string(),
+                        );
+                        println!("Export failed: {error}");
+                    }
                 }
             }
             "exit" => {
@@ -403,19 +550,37 @@ fn bootstrap_admin(state: &mut AppState, session: &mut Option<Session>) {
         Ok(_) => match state.identities.authenticate(&username, &password) {
             Ok(created_session) => {
                 *session = Some(created_session);
+                record_cli_audit(
+                    state,
+                    session,
+                    AuditAction::BootstrapAdmin,
+                    AuditOutcome::Success,
+                    Some(format!("user:{id}")),
+                    "admin bootstrapped",
+                );
                 println!("Admin created and logged in");
             }
             Err(error) => print_identity_error("Automatic login failed", error),
         },
-        Err(error) => print_identity_error("Admin bootstrap failed", error),
+        Err(error) => {
+            record_cli_audit(
+                state,
+                session,
+                AuditAction::BootstrapAdmin,
+                AuditOutcome::Failure,
+                Some(format!("user:{id}")),
+                error.to_string(),
+            );
+            print_identity_error("Admin bootstrap failed", error);
+        }
     }
 }
 
-fn login(state: &AppState, session: &mut Option<Session>) {
+fn login(state: &mut AppState, session: &mut Option<Session>) {
     let username = read_text("Username: ");
     let password = read_text("Password: ");
 
-    match state.identities.authenticate(username, &password) {
+    match state.identities.authenticate(&username, &password) {
         Ok(created_session) => {
             println!(
                 "Logged in as {} ({})",
@@ -423,8 +588,26 @@ fn login(state: &AppState, session: &mut Option<Session>) {
                 created_session.role()
             );
             *session = Some(created_session);
+            record_cli_audit(
+                state,
+                session,
+                AuditAction::Login,
+                AuditOutcome::Success,
+                None,
+                "login succeeded",
+            );
         }
-        Err(error) => print_identity_error("Login failed", error),
+        Err(error) => {
+            record_cli_audit(
+                state,
+                session,
+                AuditAction::Login,
+                AuditOutcome::Failure,
+                Some(format!("username:{username}")),
+                error.to_string(),
+            );
+            print_identity_error("Login failed", error);
+        }
     }
 }
 
@@ -655,10 +838,33 @@ fn print_account_statement(account: &Account) {
 
     for transaction in account.transactions() {
         println!(
-            "- {} | Amount: {} | {}",
+            "- #{} | {} | {} | Amount: {} | {}",
+            transaction.id(),
+            transaction.occurred_at_epoch_seconds(),
             transaction.kind(),
             transaction.amount(),
             transaction.description()
+        );
+    }
+}
+
+fn print_audit_log(state: &AppState) {
+    if state.audit_log.entries().is_empty() {
+        println!("No audit entries found");
+        return;
+    }
+
+    for entry in state.audit_log.entries() {
+        let target = entry.target().unwrap_or("none");
+        println!(
+            "#{} | {} | {} | {} | {} | {} | {}",
+            entry.id(),
+            entry.occurred_at_epoch_seconds(),
+            entry.actor(),
+            entry.action(),
+            entry.outcome(),
+            target,
+            entry.message()
         );
     }
 }
@@ -694,6 +900,61 @@ fn print_bank_result(result: BankResult<()>, success_message: &str) {
     match result {
         Ok(()) => println!("{success_message}"),
         Err(error) => print_bank_error("Operation failed", error),
+    }
+}
+
+fn print_bank_result_with_audit(
+    state: &mut AppState,
+    session: &Option<Session>,
+    result: BankResult<()>,
+    success_message: &str,
+    action: AuditAction,
+    target: Option<String>,
+) {
+    match result {
+        Ok(()) => {
+            record_cli_audit(
+                state,
+                session,
+                action,
+                AuditOutcome::Success,
+                target,
+                success_message,
+            );
+            println!("{success_message}");
+        }
+        Err(error) => {
+            record_cli_audit(
+                state,
+                session,
+                action,
+                AuditOutcome::Failure,
+                target,
+                error.to_string(),
+            );
+            print_bank_error("Operation failed", error);
+        }
+    }
+}
+
+fn record_cli_audit(
+    state: &mut AppState,
+    session: &Option<Session>,
+    action: AuditAction,
+    outcome: AuditOutcome,
+    target: Option<String>,
+    message: impl Into<String>,
+) {
+    let actor = session
+        .as_ref()
+        .map(AuditActor::from_session)
+        .unwrap_or(AuditActor::System);
+
+    if let Err(error) = state
+        .audit_log
+        .record(actor, action, outcome, target, message)
+    {
+        println!("Audit log failed: {error}");
     }
 }
 
