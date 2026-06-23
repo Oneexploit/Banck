@@ -1,124 +1,75 @@
 # Bank
 
-A Rust banking practice project that is being upgraded in phases from a simple CLI exercise into a cleaner, testable banking application.
+![Banking platform hero](assets/readme/banking-platform-hero.png)
 
-## Phase Roadmap
+A professional Rust banking practice project evolved from a simple CLI exercise into a layered, testable banking application with identity, role-based authorization, audit logging, REST APIs, SQLite persistence, and token-based API sessions.
 
-### Phase 1: Core Banking Foundation
+This repository is an educational backend project, not production financial software.
 
-Status: complete.
+## Language
 
-- Split the application into `domain`, `bank`, and `cli` modules.
-- Replaced floating point money with a cent-based `Money` type.
-- Added typed banking errors with `Result` instead of domain-level `println!`.
-- Added account status, transaction kinds, loan balance, transfer, fee, interest, and statement support in the core service.
-- Added unit tests for money parsing and critical banking flows.
-- Kept the existing CLI commands working on top of the new service layer.
+- [English](#english)
+- [فارسی](#فارسی)
 
-### Phase 2: Durable Storage
+## English
 
-Status: complete.
+### Overview
 
-- Add structured serialization with `serde`.
-- Load and save accounts from JSON first, then prepare for SQLite/Postgres.
-- Separate exportable statements from internal application state.
-- Add tests for persistence and corrupted input handling.
-- Add CLI commands for `save`, `load`, and `export`.
+`bank` is a Rust application that models core banking operations while keeping the codebase clean, modular, and testable. It includes a CLI for local workflows, an Axum HTTP API for product-facing access, durable JSON and SQLite storage, operational audit trails, and API hardening features.
 
-### Phase 3: Security and Identity
+### Highlights
 
-Status: complete.
+- Cent-based money model instead of floating point arithmetic.
+- Account lifecycle: create, update profile, activate, deactivate, close, and delete.
+- Banking operations: deposit, withdraw, transfer, fees, interest, loan request, and loan payment.
+- Customer identity records and role-based permissions for customer, teller, and admin users.
+- Argon2 password hashing.
+- Token-based API sessions with Bearer authentication and logout/revocation.
+- Audit log with actor, action, outcome, target, message, and timestamp.
+- JSON snapshots plus normalized SQLite persistence with migrations and indexes.
+- Queryable audit and transaction history endpoints.
+- Request IDs, structured tracing, and login throttling for API hardening.
+- Unit and API tests covering core banking, identity, storage, SQLite migration, and authorization flows.
 
-- Add customer identity records.
-- Add authentication scaffolding with login/logout sessions.
-- Hash secrets with Argon2 instead of storing raw values.
-- Add role-based operations for customer, teller, and admin flows.
-- Link accounts to customer owners and restrict customer access to owned accounts.
+### Architecture
 
-### Phase 4: API and Product Layer
-
-Status: complete.
-
-- Add a REST API with Axum.
-- Keep the CLI as the default admin/dev client.
-- Add protected endpoints for identity and banking operations.
-- Add request validation, structured JSON responses, and API tests.
-- Add a `serve` command for running the HTTP API.
-
-### Phase 5: Operational Quality
-
-Status: complete.
-
-- Add CI for formatting, Clippy, tests, and dependency audit checks.
-- Add transaction IDs and timestamps to account transactions.
-- Add an application audit log with actor, action, outcome, target, message, and timestamp.
-- Persist audit entries in the application JSON snapshot and support upgrading version 2 snapshots.
-- Add an API endpoint for audit review.
-
-### Phase 6: SQLite Persistence
-
-Status: complete.
-
-- Add a SQLite persistence backend with `schema_migrations`.
-- Store full application state in a durable `app_state` snapshot table as the compatibility format.
-- Add SQLite round-trip and migration tests.
-- Add CLI commands for `save_sqlite` and `load_sqlite`.
-
-### Phase 7: Normalized SQLite Storage
-
-Status: complete.
-
-- Add schema version 2 with normalized `customers`, `users`, `accounts`, `transactions`, and `audit_entries` tables.
-- Migrate version 1 snapshot databases into the normalized tables automatically.
-- Prefer normalized tables on load while keeping the snapshot table as a fallback.
-- Add tests for normalized writes, stale snapshot tolerance, and version 1 migration.
-
-### Phase 8: Queryable Operations
-
-Status: complete.
-
-- Add query parameters to `GET /audit` for action, outcome, target, time windows, limit, and sort order.
-- Add `GET /accounts/{id}/transactions` with account-scoped authorization, kind filtering, time windows, limit, and sort order.
-- Add SQLite schema version 3 with indexes for account owner lookups, transaction history, and audit review queries.
-- Add API and migration tests for the new query paths.
-
-### Phase 9: API Operational Hardening
-
-Status: complete.
-
-- Add structured tracing for API startup and completed requests.
-- Add `x-request-id` propagation/generation on every API response.
-- Add temporary login throttling after repeated failed authentication attempts.
-- Add tests for request IDs and login throttling.
-
-### Phase 10: Token-Based API Sessions
-
-Status: complete.
-
-- Replace password-per-request API authentication with opaque Bearer session tokens.
-- Return access tokens from bootstrap and login responses with an expiration timestamp.
-- Add `POST /auth/logout` to revoke the current token.
-- Record logout events in the audit trail and persist them through SQLite.
-
-### Future Hardening
-
-Planned:
-
-- Add Postgres support and production-grade migrations.
-- Add persistent account lockout policies and administrative unlock workflows.
-- Replace opaque in-memory API tokens with signed or durable refreshable sessions.
-
-## Development Checks
-
-Run these before shipping a phase:
-
-```bash
-cargo fmt -- --check
-cargo clippy -- -D warnings
-cargo test
+```text
+src/
+  api.rs           Axum REST API, Bearer sessions, request tracing, API tests
+  app.rs           Application state composition
+  audit.rs         Audit log domain model
+  bank.rs          Core banking service and business rules
+  cli.rs           Interactive command-line client
+  domain.rs        Money, account, transaction, and shared domain types
+  identity.rs      Customers, users, roles, permissions, authentication
+  sqlite_store.rs  SQLite schema migrations and normalized persistence
+  storage.rs       JSON snapshots and statement export
 ```
 
-## Running
+### API Authentication
+
+The API starts empty. Bootstrap the first admin, then use the returned access token:
+
+```bash
+curl -X POST http://127.0.0.1:3000/auth/bootstrap-admin \
+  -H "content-type: application/json" \
+  -d '{"user_id":1,"username":"admin","password":"correct-password"}'
+```
+
+Protected endpoints require:
+
+```text
+Authorization: Bearer <access_token>
+```
+
+Logout revokes the current token:
+
+```bash
+curl -X POST http://127.0.0.1:3000/auth/logout \
+  -H "authorization: Bearer <access_token>"
+```
+
+### Running
 
 Start the CLI:
 
@@ -132,4 +83,129 @@ Start the HTTP API:
 cargo run -- serve 127.0.0.1:3000
 ```
 
-The API starts empty. Use `POST /auth/bootstrap-admin` first, then call protected endpoints with `Authorization: Bearer <access_token>`.
+Run development checks:
+
+```bash
+cargo fmt -- --check
+cargo clippy --all-targets -- -D warnings
+cargo test
+```
+
+### Completed Phases
+
+| Phase | Status | Summary |
+| --- | --- | --- |
+| 1 | Complete | Core banking foundation, typed errors, cent-based money, account operations |
+| 2 | Complete | JSON storage, statement export, persistence tests |
+| 3 | Complete | Customers, users, roles, permissions, Argon2 password hashing |
+| 4 | Complete | Axum REST API, protected banking and identity endpoints |
+| 5 | Complete | CI checks, transaction IDs, timestamps, audit log |
+| 6 | Complete | SQLite backend with schema migrations |
+| 7 | Complete | Normalized SQLite tables for customers, users, accounts, transactions, audit entries |
+| 8 | Complete | Queryable audit and transaction history endpoints with SQLite indexes |
+| 9 | Complete | Request IDs, structured tracing, login throttling |
+| 10 | Complete | Bearer session tokens, token expiration, logout/revocation |
+
+### Next Hardening Ideas
+
+- Durable refreshable API sessions.
+- Postgres support and production-grade migrations.
+- Administrative unlock workflows for account lockouts.
+- More complete OpenAPI documentation.
+- Background jobs for scheduled fees, interest, and statement generation.
+
+## فارسی
+
+### معرفی
+
+`bank` یک پروژه تمرینی اما جدی با Rust است که از یک برنامه ساده خط فرمان به یک backend بانکی چندلایه، تست‌پذیر و قابل توسعه تبدیل شده است. پروژه شامل منطق بانکی، هویت کاربران، سطح دسترسی، API، audit log، ذخیره‌سازی JSON و SQLite، session token، و سخت‌سازی عملیاتی API است.
+
+این پروژه برای یادگیری و نمایش مهارت backend طراحی شده و نرم‌افزار مالی production محسوب نمی‌شود.
+
+### قابلیت‌های اصلی
+
+- مدل پول دقیق بر اساس cent، بدون استفاده از float.
+- مدیریت چرخه عمر حساب: ساخت، ویرایش پروفایل، فعال‌سازی، غیرفعال‌سازی، بستن و حذف حساب.
+- عملیات بانکی: واریز، برداشت، انتقال، کارمزد، سود، درخواست وام و پرداخت وام.
+- تعریف مشتری، کاربر، نقش‌ها و permission برای customer، teller و admin.
+- هش کردن رمز عبور با Argon2.
+- احراز هویت API با Bearer token، انقضا و logout/revocation.
+- audit log برای ثبت actor، action، outcome، target، پیام و زمان.
+- ذخیره‌سازی snapshot با JSON و ذخیره‌سازی جدولی SQLite با migration.
+- endpointهای قابل query برای audit و تاریخچه تراکنش‌ها.
+- request id، tracing ساخت‌یافته و محدودسازی تلاش‌های ناموفق login.
+- تست‌های واحد و API برای منطق بانکی، هویت، ذخیره‌سازی، migration و authorization.
+
+### ساختار پروژه
+
+```text
+src/
+  api.rs           REST API با Axum، session token، tracing و تست‌های API
+  app.rs           ترکیب state اصلی برنامه
+  audit.rs         مدل audit log
+  bank.rs          منطق اصلی بانک و قوانین تجاری
+  cli.rs           رابط خط فرمان تعاملی
+  domain.rs        Money، Account، Transaction و typeهای دامنه
+  identity.rs      Customer، User، Role، Permission و authentication
+  sqlite_store.rs  migration و persistence نرمال‌شده SQLite
+  storage.rs       snapshotهای JSON و خروجی statement
+```
+
+### اجرای پروژه
+
+اجرای CLI:
+
+```bash
+cargo run
+```
+
+اجرای HTTP API:
+
+```bash
+cargo run -- serve 127.0.0.1:3000
+```
+
+ابتدا admin اولیه را بسازید:
+
+```bash
+curl -X POST http://127.0.0.1:3000/auth/bootstrap-admin \
+  -H "content-type: application/json" \
+  -d '{"user_id":1,"username":"admin","password":"correct-password"}'
+```
+
+سپس برای endpointهای محافظت‌شده از توکن برگشتی استفاده کنید:
+
+```text
+Authorization: Bearer <access_token>
+```
+
+بررسی کیفیت کد:
+
+```bash
+cargo fmt -- --check
+cargo clippy --all-targets -- -D warnings
+cargo test
+```
+
+### فازهای انجام‌شده
+
+| فاز | وضعیت | خلاصه |
+| --- | --- | --- |
+| 1 | کامل | پایه منطق بانکی، خطاهای typed، مدل دقیق Money و عملیات حساب |
+| 2 | کامل | ذخیره‌سازی JSON، خروجی statement و تست persistence |
+| 3 | کامل | مشتری، کاربر، نقش‌ها، permission و هش رمز با Argon2 |
+| 4 | کامل | REST API با Axum و endpointهای محافظت‌شده |
+| 5 | کامل | CI، شناسه تراکنش، timestamp و audit log |
+| 6 | کامل | SQLite backend با schema migration |
+| 7 | کامل | جدول‌های نرمال‌شده SQLite برای مشتری، کاربر، حساب، تراکنش و audit |
+| 8 | کامل | query برای audit و transaction history همراه با indexهای SQLite |
+| 9 | کامل | request id، tracing ساخت‌یافته و login throttling |
+| 10 | کامل | Bearer session token، انقضا و logout/revocation |
+
+### مسیرهای پیشنهادی بعدی
+
+- sessionهای ماندگار و refreshable.
+- پشتیبانی Postgres و migrationهای production-grade.
+- workflow مدیریتی برای باز کردن lock کاربران.
+- مستندات OpenAPI.
+- jobهای زمان‌بندی‌شده برای کارمزد، سود و تولید statement.
