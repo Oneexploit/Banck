@@ -37,11 +37,13 @@ Status: complete.
 
 ### Phase 4: API and Product Layer
 
-Planned:
+Status: complete.
 
-- Add a REST API with a Rust web framework.
-- Keep the CLI as an admin/dev client.
-- Add request validation, structured responses, and API tests.
+- Add a REST API with Axum.
+- Keep the CLI as the default admin/dev client.
+- Add Basic-auth protected endpoints for identity and banking operations.
+- Add request validation, structured JSON responses, and API tests.
+- Add a `serve` command for running the HTTP API.
 
 ### Phase 5: Operational Quality
 
@@ -61,3 +63,19 @@ cargo fmt -- --check
 cargo clippy -- -D warnings
 cargo test
 ```
+
+## Running
+
+Start the CLI:
+
+```bash
+cargo run
+```
+
+Start the HTTP API:
+
+```bash
+cargo run -- serve 127.0.0.1:3000
+```
+
+The API starts empty. Use `POST /auth/bootstrap-admin` first, then call protected endpoints with Basic auth.
