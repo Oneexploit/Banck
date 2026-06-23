@@ -2,6 +2,8 @@ use std::{error::Error, fmt, str::FromStr};
 
 use serde::{Deserialize, Serialize};
 
+pub use crate::identity::CustomerId;
+
 pub type AccountId = u32;
 
 #[derive(
@@ -382,6 +384,7 @@ impl Transaction {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Account {
     pub(crate) id: AccountId,
+    pub(crate) owner_id: Option<CustomerId>,
     pub(crate) name: String,
     pub(crate) email: String,
     pub(crate) balance: Money,
@@ -393,12 +396,14 @@ pub struct Account {
 impl Account {
     pub(crate) fn new(
         id: AccountId,
+        owner_id: Option<CustomerId>,
         name: impl Into<String>,
         email: impl Into<String>,
         opening_balance: Money,
     ) -> Self {
         let mut account = Self {
             id,
+            owner_id,
             name: name.into(),
             email: email.into(),
             balance: opening_balance,
@@ -418,6 +423,10 @@ impl Account {
 
     pub const fn id(&self) -> AccountId {
         self.id
+    }
+
+    pub const fn owner_id(&self) -> Option<CustomerId> {
+        self.owner_id
     }
 
     pub fn name(&self) -> &str {

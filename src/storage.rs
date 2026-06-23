@@ -7,11 +7,14 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    app::AppState,
     bank::{Bank, BankError},
     domain::Account,
+    identity::{Customer, CustomerId, IdentityError, IdentityStore, User},
 };
 
-const CURRENT_STORAGE_VERSION: u32 = 1;
+const CURRENT_BANK_STORAGE_VERSION: u32 = 1;
+const CURRENT_APP_STORAGE_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct BankSnapshot {
@@ -22,18 +25,45 @@ struct BankSnapshot {
 impl BankSnapshot {
     fn from_bank(bank: &Bank) -> Self {
         Self {
-            version: CURRENT_STORAGE_VERSION,
+            version: CURRENT_BANK_STORAGE_VERSION,
             accounts: bank.accounts().cloned().collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct AppSnapshot {
+    version: u32,
+    accounts: Vec<Account>,
+    customers: Vec<Customer>,
+    users: Vec<User>,
+}
+
+impl AppSnapshot {
+    fn from_state(state: &AppState) -> Self {
+        Self {
+            version: CURRENT_APP_STORAGE_VERSION,
+            accounts: state.bank.accounts().cloned().collect(),
+            customers: state.identities.customers().cloned().collect(),
+            users: state.identities.users().cloned().collect(),
         }
     }
 }
 
 #[derive(Debug)]
 pub enum StorageError {
-    Io { path: PathBuf, source: io::Error },
+    Io {
+        path: PathBuf,
+        source: io::Error,
+    },
     Json(serde_json::Error),
     UnsupportedVersion(u32),
     InvalidBankState(BankError),
+    InvalidIdentityState(IdentityError),
+    InvalidAccountOwner {
+        account_id: u32,
+        customer_id: CustomerId,
+    },
 }
 
 impl fmt::Display for StorageError {
@@ -45,6 +75,16 @@ impl fmt::Display for StorageError {
                 write!(formatter, "unsupported bank storage version {version}")
             }
             Self::InvalidBankState(source) => write!(formatter, "invalid bank state: {source}"),
+            Self::InvalidIdentityState(source) => {
+                write!(formatter, "invalid identity state: {source}")
+            }
+            Self::InvalidAccountOwner {
+                account_id,
+                customer_id,
+            } => write!(
+                formatter,
+                "account {account_id} references missing customer {customer_id}"
+            ),
         }
     }
 }
@@ -55,7 +95,9 @@ impl Error for StorageError {
             Self::Io { source, .. } => Some(source),
             Self::Json(source) => Some(source),
             Self::InvalidBankState(source) => Some(source),
+            Self::InvalidIdentityState(source) => Some(source),
             Self::UnsupportedVersion(_) => None,
+            Self::InvalidAccountOwner { .. } => None,
         }
     }
 }
@@ -69,11 +111,31 @@ pub fn bank_to_json(bank: &Bank) -> StorageResult<String> {
 pub fn bank_from_json(input: &str) -> StorageResult<Bank> {
     let snapshot: BankSnapshot = serde_json::from_str(input).map_err(StorageError::Json)?;
 
-    if snapshot.version != CURRENT_STORAGE_VERSION {
+    if snapshot.version != CURRENT_BANK_STORAGE_VERSION {
         return Err(StorageError::UnsupportedVersion(snapshot.version));
     }
 
     Bank::from_accounts(snapshot.accounts).map_err(StorageError::InvalidBankState)
+}
+
+pub fn app_to_json(state: &AppState) -> StorageResult<String> {
+    serde_json::to_string_pretty(&AppSnapshot::from_state(state)).map_err(StorageError::Json)
+}
+
+pub fn app_from_json(input: &str) -> StorageResult<AppState> {
+    let snapshot: AppSnapshot = serde_json::from_str(input).map_err(StorageError::Json)?;
+
+    if snapshot.version != CURRENT_APP_STORAGE_VERSION {
+        return Err(StorageError::UnsupportedVersion(snapshot.version));
+    }
+
+    let identities = IdentityStore::from_records(snapshot.customers, snapshot.users)
+        .map_err(StorageError::InvalidIdentityState)?;
+    let bank = Bank::from_accounts(snapshot.accounts).map_err(StorageError::InvalidBankState)?;
+
+    validate_account_owners(&bank, &identities)?;
+
+    Ok(AppState::from_parts(bank, identities))
 }
 
 pub fn save_bank_to_json_file(bank: &Bank, path: impl AsRef<Path>) -> StorageResult<()> {
@@ -94,6 +156,26 @@ pub fn load_bank_from_json_file(path: impl AsRef<Path>) -> StorageResult<Bank> {
     })?;
 
     bank_from_json(&json)
+}
+
+pub fn save_app_to_json_file(state: &AppState, path: impl AsRef<Path>) -> StorageResult<()> {
+    let path = path.as_ref();
+    let json = app_to_json(state)?;
+
+    fs::write(path, json).map_err(|source| StorageError::Io {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+pub fn load_app_from_json_file(path: impl AsRef<Path>) -> StorageResult<AppState> {
+    let path = path.as_ref();
+    let json = fs::read_to_string(path).map_err(|source| StorageError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+
+    app_from_json(&json)
 }
 
 pub fn bank_statement_text(bank: &Bank) -> String {
@@ -136,6 +218,21 @@ fn account_summary(account: &Account) -> String {
     )
 }
 
+fn validate_account_owners(bank: &Bank, identities: &IdentityStore) -> StorageResult<()> {
+    for account in bank.accounts() {
+        if let Some(customer_id) = account.owner_id() {
+            identities
+                .customer(customer_id)
+                .map_err(|_| StorageError::InvalidAccountOwner {
+                    account_id: account.id(),
+                    customer_id,
+                })?;
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -145,12 +242,14 @@ mod tests {
     };
 
     use super::{
-        StorageError, bank_from_json, bank_to_json, load_bank_from_json_file,
-        save_bank_to_json_file,
+        StorageError, app_from_json, app_to_json, bank_from_json, bank_to_json,
+        load_bank_from_json_file, save_bank_to_json_file,
     };
     use crate::{
+        app::AppState,
         bank::{Bank, BankError},
         domain::Money,
+        identity::{IdentityStore, Role},
     };
 
     fn money(input: &str) -> Money {
@@ -159,9 +258,9 @@ mod tests {
 
     fn sample_bank() -> Bank {
         let mut bank = Bank::new();
-        bank.create_account(1, "Alice", "alice@example.com", money("100.00"))
+        bank.create_account(1, None, "Alice", "alice@example.com", money("100.00"))
             .unwrap();
-        bank.create_account(2, "Bob", "bob@example.com", money("25.50"))
+        bank.create_account(2, None, "Bob", "bob@example.com", money("25.50"))
             .unwrap();
         bank.transfer(1, 2, money("10.25")).unwrap();
         bank.request_loan(2, money("50.00")).unwrap();
@@ -253,6 +352,74 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::InvalidBankState(BankError::AccountAlreadyExists(1))
+        ));
+    }
+
+    #[test]
+    fn serializes_and_deserializes_full_app_state() {
+        let mut identities = IdentityStore::new();
+        identities
+            .create_customer(10, "Alice", "alice@example.com")
+            .unwrap();
+        identities
+            .create_user(1, "alice", Role::Customer, Some(10), "correct-password")
+            .unwrap();
+
+        let mut bank = Bank::new();
+        bank.create_account(
+            1,
+            Some(10),
+            "Alice Checking",
+            "alice@example.com",
+            money("42.00"),
+        )
+        .unwrap();
+
+        let state = AppState::from_parts(bank, identities);
+        let json = app_to_json(&state).unwrap();
+        let restored = app_from_json(&json).unwrap();
+
+        assert_eq!(restored.bank.account(1).unwrap().owner_id(), Some(10));
+        assert_eq!(
+            restored
+                .identities
+                .authenticate("alice", "correct-password")
+                .unwrap()
+                .customer_id(),
+            Some(10)
+        );
+    }
+
+    #[test]
+    fn rejects_accounts_with_missing_owners_in_app_state() {
+        let json = r#"
+        {
+          "version": 2,
+          "customers": [],
+          "users": [],
+          "accounts": [
+            {
+              "id": 1,
+              "owner_id": 99,
+              "name": "Orphan Account",
+              "email": "orphan@example.com",
+              "balance": 0,
+              "loan_balance": 0,
+              "status": "active",
+              "transactions": []
+            }
+          ]
+        }
+        "#;
+
+        let error = app_from_json(json).unwrap_err();
+
+        assert!(matches!(
+            error,
+            StorageError::InvalidAccountOwner {
+                account_id: 1,
+                customer_id: 99
+            }
         ));
     }
 }

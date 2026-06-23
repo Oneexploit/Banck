@@ -1,7 +1,8 @@
 use std::{collections::BTreeMap, error::Error, fmt};
 
 use crate::domain::{
-    Account, AccountId, AccountStatus, InterestRate, Money, Transaction, TransactionKind,
+    Account, AccountId, AccountStatus, CustomerId, InterestRate, Money, Transaction,
+    TransactionKind,
 };
 
 pub type BankResult<T> = Result<T, BankError>;
@@ -114,6 +115,7 @@ impl Bank {
     pub fn create_account(
         &mut self,
         id: AccountId,
+        owner_id: Option<CustomerId>,
         name: impl Into<String>,
         email: impl Into<String>,
         opening_balance: Money,
@@ -126,7 +128,7 @@ impl Bank {
 
         let name = clean_name(name.into())?;
         let email = clean_email(email.into())?;
-        let account = Account::new(id, name, email, opening_balance);
+        let account = Account::new(id, owner_id, name, email, opening_balance);
 
         self.accounts.insert(id, account);
         Ok(self.accounts.get(&id).expect("inserted account must exist"))
@@ -552,9 +554,9 @@ mod tests {
 
     fn bank_with_two_accounts() -> Bank {
         let mut bank = Bank::new();
-        bank.create_account(1, "Alice", "alice@example.com", money("100.00"))
+        bank.create_account(1, None, "Alice", "alice@example.com", money("100.00"))
             .unwrap();
-        bank.create_account(2, "Bob", "bob@example.com", money("25.50"))
+        bank.create_account(2, None, "Bob", "bob@example.com", money("25.50"))
             .unwrap();
         bank
     }
@@ -562,11 +564,11 @@ mod tests {
     #[test]
     fn rejects_duplicate_accounts() {
         let mut bank = Bank::new();
-        bank.create_account(1, "Alice", "alice@example.com", Money::ZERO)
+        bank.create_account(1, None, "Alice", "alice@example.com", Money::ZERO)
             .unwrap();
 
         assert_eq!(
-            bank.create_account(1, "Alice", "alice@example.com", Money::ZERO),
+            bank.create_account(1, None, "Alice", "alice@example.com", Money::ZERO),
             Err(BankError::AccountAlreadyExists(1))
         );
     }
@@ -641,7 +643,7 @@ mod tests {
     #[test]
     fn loan_payment_is_capped_to_outstanding_balance() {
         let mut bank = Bank::new();
-        bank.create_account(1, "Alice", "alice@example.com", money("10.00"))
+        bank.create_account(1, None, "Alice", "alice@example.com", money("10.00"))
             .unwrap();
         bank.request_loan(1, money("50.00")).unwrap();
 
@@ -657,5 +659,15 @@ mod tests {
         let bank = bank_with_two_accounts();
 
         assert_eq!(bank.total_balance().unwrap(), money("125.50"));
+    }
+
+    #[test]
+    fn accounts_can_be_linked_to_customers() {
+        let mut bank = Bank::new();
+
+        bank.create_account(1, Some(10), "Alice", "alice@example.com", Money::ZERO)
+            .unwrap();
+
+        assert_eq!(bank.account(1).unwrap().owner_id(), Some(10));
     }
 }

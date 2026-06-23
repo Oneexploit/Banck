@@ -27,12 +27,13 @@ Status: complete.
 
 ### Phase 3: Security and Identity
 
-Planned:
+Status: complete.
 
 - Add customer identity records.
-- Add authentication scaffolding.
-- Hash secrets instead of storing raw values.
-- Add role-based operations for teller/admin/customer flows.
+- Add authentication scaffolding with login/logout sessions.
+- Hash secrets with Argon2 instead of storing raw values.
+- Add role-based operations for customer, teller, and admin flows.
+- Link accounts to customer owners and restrict customer access to owned accounts.
 
 ### Phase 4: API and Product Layer
 
