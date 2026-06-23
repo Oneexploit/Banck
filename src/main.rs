@@ -7,6 +7,7 @@ async fn main() {
     let command = env::args().nth(1);
 
     if command.as_deref() == Some("serve") {
+        bank::api::init_tracing();
         let address = env::args()
             .nth(2)
             .unwrap_or_else(|| "127.0.0.1:3000".to_string())

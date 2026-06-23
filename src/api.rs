@@ -1,35 +1,68 @@
-use std::{net::SocketAddr, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    net::SocketAddr,
+    sync::{
+        Arc, Once,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Instant,
+};
 
 use axum::{
     Json, Router,
+    body::Body,
     extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, HeaderValue, Request, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use serde::{Deserialize, Serialize};
-use tokio::{net::TcpListener, sync::RwLock};
+use tokio::{
+    net::TcpListener,
+    sync::{Mutex, RwLock},
+};
+use tracing::{info, warn};
+use tracing_subscriber::EnvFilter;
 
 use crate::{
     app::AppState,
     audit::{AuditAction, AuditActor, AuditEntry, AuditOutcome},
     bank::{BankError, BankResult},
-    domain::{Account, AccountId, CustomerId, Money, Transaction},
+    domain::{Account, AccountId, CustomerId, Money, Transaction, current_epoch_seconds},
     identity::{Customer, IdentityError, IdentityStore, Permission, Role, Session, User, UserId},
 };
+
+const REQUEST_ID_HEADER: &str = "x-request-id";
+const FAILED_LOGIN_LIMIT: usize = 5;
+const FAILED_LOGIN_WINDOW_SECONDS: u64 = 15 * 60;
+const FAILED_LOGIN_LOCKOUT_SECONDS: u64 = 15 * 60;
+
+static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
+static TRACING_INIT: Once = Once::new();
 
 #[derive(Clone)]
 pub struct ApiState {
     app: Arc<RwLock<AppState>>,
+    auth_throttle: Arc<Mutex<AuthThrottle>>,
 }
 
 impl ApiState {
     pub fn new(app: AppState) -> Self {
         Self {
             app: Arc::new(RwLock::new(app)),
+            auth_throttle: Arc::new(Mutex::new(AuthThrottle::new())),
         }
     }
+}
+
+pub fn init_tracing() {
+    TRACING_INIT.call_once(|| {
+        let filter =
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("bank=info"));
+        let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
+    });
 }
 
 pub fn router(app: AppState) -> Router {
@@ -53,11 +86,54 @@ pub fn router(app: AppState) -> Router {
         .route("/transfers", post(transfer))
         .route("/audit", get(list_audit))
         .with_state(ApiState::new(app))
+        .layer(middleware::from_fn(request_context))
 }
 
 pub async fn serve(app: AppState, address: SocketAddr) -> std::io::Result<()> {
     let listener = TcpListener::bind(address).await?;
+    info!(%address, "api server listening");
     axum::serve(listener, router(app)).await
+}
+
+async fn request_context(request: Request<Body>, next: Next) -> Response {
+    let request_id = request_id_from_headers(request.headers()).unwrap_or_else(next_request_id);
+    let method = request.method().clone();
+    let uri = request.uri().clone();
+    let started = Instant::now();
+    let mut response = next.run(request).await;
+    let status = response.status();
+    let latency_ms = started.elapsed().as_millis();
+
+    if let Ok(header_value) = HeaderValue::from_str(&request_id) {
+        response
+            .headers_mut()
+            .insert(REQUEST_ID_HEADER, header_value);
+    }
+
+    info!(
+        request_id = %request_id,
+        method = %method,
+        uri = %uri,
+        status = status.as_u16(),
+        latency_ms,
+        "request completed"
+    );
+
+    response
+}
+
+fn request_id_from_headers(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(REQUEST_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn next_request_id() -> String {
+    let sequence = REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("req-{}-{sequence}", current_epoch_seconds())
 }
 
 async fn health() -> Json<HealthResponse> {
@@ -123,12 +199,20 @@ async fn login(
     State(state): State<ApiState>,
     Json(payload): Json<LoginRequest>,
 ) -> Result<Json<SessionResponse>, ApiError> {
+    let username = payload.username.clone();
+    state
+        .auth_throttle
+        .lock()
+        .await
+        .ensure_allowed(&username, current_epoch_seconds())?;
+
     let mut app = state.app.write().await;
     let session = match app
         .identities
         .authenticate(&payload.username, &payload.password)
     {
         Ok(session) => {
+            state.auth_throttle.lock().await.record_success(&username);
             record_audit(
                 &mut app,
                 AuditActor::from_session(&session),
@@ -141,6 +225,11 @@ async fn login(
         }
         Err(error) => {
             let message = error.to_string();
+            state
+                .auth_throttle
+                .lock()
+                .await
+                .record_failure(&username, current_epoch_seconds());
             record_audit(
                 &mut app,
                 AuditActor::System,
@@ -771,6 +860,97 @@ fn timestamp_matches_query(
     true
 }
 
+#[derive(Debug, Default)]
+struct AuthThrottle {
+    failures_by_username: BTreeMap<String, FailedLoginRecord>,
+}
+
+impl AuthThrottle {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn ensure_allowed(&mut self, username: &str, now: u64) -> Result<(), ApiError> {
+        let username = throttle_key(username);
+        self.expire_if_needed(&username, now);
+
+        if let Some(record) = self.failures_by_username.get(&username)
+            && let Some(locked_until) = record.locked_until_epoch_seconds
+            && now < locked_until
+        {
+            return Err(ApiError::too_many_requests(
+                "too many failed login attempts; try again later",
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn record_success(&mut self, username: &str) {
+        self.failures_by_username.remove(&throttle_key(username));
+    }
+
+    fn record_failure(&mut self, username: &str, now: u64) {
+        let username = throttle_key(username);
+        self.expire_if_needed(&username, now);
+        let record = self
+            .failures_by_username
+            .entry(username.clone())
+            .or_insert_with(|| FailedLoginRecord::new(now));
+        record.failed_attempts += 1;
+
+        if record.failed_attempts >= FAILED_LOGIN_LIMIT {
+            let locked_until = now.saturating_add(FAILED_LOGIN_LOCKOUT_SECONDS);
+            record.locked_until_epoch_seconds = Some(locked_until);
+            warn!(
+                username = %username,
+                failed_attempts = record.failed_attempts,
+                locked_until_epoch_seconds = locked_until,
+                "login temporarily locked"
+            );
+        }
+    }
+
+    fn expire_if_needed(&mut self, username: &str, now: u64) {
+        let should_expire = self
+            .failures_by_username
+            .get(username)
+            .map(|record| {
+                record
+                    .locked_until_epoch_seconds
+                    .is_some_and(|locked_until| now >= locked_until)
+                    || now.saturating_sub(record.first_failed_at_epoch_seconds)
+                        >= FAILED_LOGIN_WINDOW_SECONDS
+            })
+            .unwrap_or(false);
+
+        if should_expire {
+            self.failures_by_username.remove(username);
+        }
+    }
+}
+
+#[derive(Debug)]
+struct FailedLoginRecord {
+    first_failed_at_epoch_seconds: u64,
+    failed_attempts: usize,
+    locked_until_epoch_seconds: Option<u64>,
+}
+
+impl FailedLoginRecord {
+    fn new(now: u64) -> Self {
+        Self {
+            first_failed_at_epoch_seconds: now,
+            failed_attempts: 0,
+            locked_until_epoch_seconds: None,
+        }
+    }
+}
+
+fn throttle_key(username: &str) -> String {
+    username.trim().to_ascii_lowercase()
+}
+
 #[derive(Debug)]
 pub struct ApiError {
     status: StatusCode,
@@ -802,6 +982,13 @@ impl ApiError {
     fn conflict(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::CONFLICT,
+            message: message.into(),
+        }
+    }
+
+    fn too_many_requests(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::TOO_MANY_REQUESTS,
             message: message.into(),
         }
     }
@@ -1207,6 +1394,77 @@ mod tests {
         let response = request(app, "GET", "/accounts", None, json!({})).await;
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn responses_include_request_id_header() {
+        let app = router(AppState::new());
+        let request = Request::builder()
+            .method("GET")
+            .uri("/health")
+            .header("x-request-id", "test-request-id")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-request-id")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "test-request-id"
+        );
+    }
+
+    #[tokio::test]
+    async fn login_is_temporarily_limited_after_repeated_failures() {
+        let app = router(AppState::new());
+
+        request(
+            app.clone(),
+            "POST",
+            "/auth/bootstrap-admin",
+            None,
+            json!({
+                "user_id": 1,
+                "username": "admin",
+                "password": "correct-password"
+            }),
+        )
+        .await;
+
+        for _ in 0..5 {
+            let response = request(
+                app.clone(),
+                "POST",
+                "/auth/login",
+                None,
+                json!({
+                    "username": "admin",
+                    "password": "wrong-password"
+                }),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        let response = request(
+            app,
+            "POST",
+            "/auth/login",
+            None,
+            json!({
+                "username": "admin",
+                "password": "wrong-password"
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 
     #[tokio::test]

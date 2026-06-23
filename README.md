@@ -82,13 +82,21 @@ Status: complete.
 - Add SQLite schema version 3 with indexes for account owner lookups, transaction history, and audit review queries.
 - Add API and migration tests for the new query paths.
 
+### Phase 9: API Operational Hardening
+
+Status: complete.
+
+- Add structured tracing for API startup and completed requests.
+- Add `x-request-id` propagation/generation on every API response.
+- Add temporary login throttling after repeated failed authentication attempts.
+- Add tests for request IDs and login throttling.
+
 ### Future Hardening
 
 Planned:
 
 - Add Postgres support and production-grade migrations.
-- Add request IDs and structured tracing/log output.
-- Add rate limiting and account lockout for failed logins.
+- Add persistent account lockout policies and administrative unlock workflows.
 - Replace Basic auth with signed session tokens for the API.
 
 ## Development Checks
