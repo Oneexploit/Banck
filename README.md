@@ -73,6 +73,15 @@ Status: complete.
 - Prefer normalized tables on load while keeping the snapshot table as a fallback.
 - Add tests for normalized writes, stale snapshot tolerance, and version 1 migration.
 
+### Phase 8: Queryable Operations
+
+Status: complete.
+
+- Add query parameters to `GET /audit` for action, outcome, target, time windows, limit, and sort order.
+- Add `GET /accounts/{id}/transactions` with account-scoped authorization, kind filtering, time windows, limit, and sort order.
+- Add SQLite schema version 3 with indexes for account owner lookups, transaction history, and audit review queries.
+- Add API and migration tests for the new query paths.
+
 ### Future Hardening
 
 Planned:

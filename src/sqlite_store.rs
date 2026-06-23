@@ -18,7 +18,7 @@ use crate::{
     storage::{StorageError, app_from_json, app_to_json},
 };
 
-const CURRENT_SQLITE_SCHEMA_VERSION: i64 = 2;
+const CURRENT_SQLITE_SCHEMA_VERSION: i64 = 3;
 
 #[derive(Debug)]
 pub enum SqliteStoreError {
@@ -161,6 +161,10 @@ fn migrate(connection: &mut Connection, path: &Path) -> SqliteStoreResult<()> {
         apply_migration_2(connection, path)?;
     }
 
+    if version < 3 {
+        apply_migration_3(connection, path)?;
+    }
+
     Ok(())
 }
 
@@ -283,6 +287,34 @@ fn apply_migration_2(connection: &mut Connection, path: &Path) -> SqliteStoreRes
 
     transaction
         .commit()
+        .map_err(|source| sqlite_error(path, source))?;
+
+    Ok(())
+}
+
+fn apply_migration_3(connection: &Connection, path: &Path) -> SqliteStoreResult<()> {
+    connection
+        .execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_accounts_owner_id
+                ON accounts(owner_id);
+            CREATE INDEX IF NOT EXISTS idx_transactions_account_time
+                ON transactions(account_id, occurred_at_epoch_seconds DESC, id DESC);
+            CREATE INDEX IF NOT EXISTS idx_transactions_kind
+                ON transactions(kind);
+            CREATE INDEX IF NOT EXISTS idx_audit_entries_action_time
+                ON audit_entries(action, occurred_at_epoch_seconds DESC, id DESC);
+            CREATE INDEX IF NOT EXISTS idx_audit_entries_outcome_time
+                ON audit_entries(outcome, occurred_at_epoch_seconds DESC, id DESC);
+            CREATE INDEX IF NOT EXISTS idx_audit_entries_target
+                ON audit_entries(target);",
+        )
+        .map_err(|source| sqlite_error(path, source))?;
+    connection
+        .execute(
+            "INSERT INTO schema_migrations (version, name, applied_at_epoch_seconds)
+             VALUES (?1, ?2, ?3)",
+            params![3_i64, "add_query_indexes", current_epoch_i64()?],
+        )
         .map_err(|source| sqlite_error(path, source))?;
 
     Ok(())
@@ -1068,13 +1100,43 @@ mod tests {
             .unwrap()
     }
 
+    fn index_exists(path: &Path, index_name: &str) -> bool {
+        let connection = Connection::open(path).unwrap();
+        connection
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1
+                    FROM sqlite_master
+                    WHERE type = 'index' AND name = ?1
+                )",
+                params![index_name],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap()
+    }
+
     #[test]
     fn initializes_schema_migrations() {
         let path = temp_sqlite_path("migration");
 
         initialize_sqlite_file(&path).unwrap();
 
-        assert_eq!(sqlite_schema_version(&path).unwrap(), 2);
+        assert_eq!(sqlite_schema_version(&path).unwrap(), 3);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn initializes_query_indexes() {
+        let path = temp_sqlite_path("indexes");
+
+        initialize_sqlite_file(&path).unwrap();
+
+        assert!(index_exists(&path, "idx_accounts_owner_id"));
+        assert!(index_exists(&path, "idx_transactions_account_time"));
+        assert!(index_exists(&path, "idx_transactions_kind"));
+        assert!(index_exists(&path, "idx_audit_entries_action_time"));
+        assert!(index_exists(&path, "idx_audit_entries_outcome_time"));
+        assert!(index_exists(&path, "idx_audit_entries_target"));
         fs::remove_file(path).unwrap();
     }
 
@@ -1145,7 +1207,7 @@ mod tests {
         let state = sample_state();
         create_v1_snapshot_database(&path, &state);
 
-        assert_eq!(sqlite_schema_version(&path).unwrap(), 2);
+        assert_eq!(sqlite_schema_version(&path).unwrap(), 3);
         assert_eq!(table_count(&path, "customers"), 1);
         assert_eq!(table_count(&path, "users"), 1);
         assert_eq!(table_count(&path, "accounts"), 1);
